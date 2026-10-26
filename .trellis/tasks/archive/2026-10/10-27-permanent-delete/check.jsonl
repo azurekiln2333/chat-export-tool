@@ -1,0 +1,2 @@
+{"file":".trellis/tasks/10-27-permanent-delete/prd.md","reason":"All user requirements including bulk deletion and day calendar"}
+{"file":".trellis/tasks/10-27-permanent-delete/design.md","reason":"Concrete interfaces and deletion semantics to verify"}
