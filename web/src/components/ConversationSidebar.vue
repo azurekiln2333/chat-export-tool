@@ -1,11 +1,28 @@
 <script setup>
-/** Conversation sidebar: search, list and selection. */
-import { ref, watch } from 'vue';
+/** Conversation sidebar: search, paginated list, selection and deletion. */
+import { computed, ref, watch } from 'vue';
 
 import Icon from './Icon.vue';
-import { loadConversations, searchConversations, selectConversation, state } from '../store.js';
+import Pager from './Pager.vue';
+import {
+  clearConversationsOnPage,
+  conversationPage,
+  conversationPageCount,
+  currentAccount,
+  deleteConversationPermanently,
+  deleteSelectedConversations,
+  goToConversationPage,
+  isConversationSelected,
+  loadConversations,
+  searchConversations,
+  selectAllConversationsOnPage,
+  selectConversation,
+  selectedConversationCount,
+  setConversationPageSize,
+  state,
+  toggleConversationSelection,
+} from '../store.js';
 import { debounce, shortTime } from '../utils.js';
-import { currentAccount } from '../store.js';
 
 const query = ref(state.conversationQuery);
 
@@ -22,6 +39,13 @@ watch(
   },
 );
 
+const pageAllSelected = computed(() => {
+  const items = state.conversations;
+  return items.length > 0 && items.every((item) => isConversationSelected(item.id));
+});
+
+const busy = computed(() => state.deleting);
+
 function clearSearch() {
   query.value = '';
   searchConversations('');
@@ -29,6 +53,19 @@ function clearSearch() {
 
 function choose(id) {
   selectConversation(id);
+}
+
+function toggleSelect(item) {
+  toggleConversationSelection(item.id, item.message_count);
+}
+
+function togglePageSelection() {
+  if (pageAllSelected.value) clearConversationsOnPage();
+  else selectAllConversationsOnPage();
+}
+
+async function removeConversation(item) {
+  await deleteConversationPermanently(item.id, item.message_count, { name: item.name });
 }
 </script>
 
@@ -62,21 +99,53 @@ function choose(id) {
           <Icon name="close" :size="14" />
         </button>
       </div>
-      <button
-        class="btn btn-sm btn-ghost"
-        type="button"
-        :disabled="!currentAccount"
-        @click="loadConversations()"
-      >
-        <Icon name="refresh" :size="14" />
-        刷新
-      </button>
+
+      <div class="selection-bar">
+        <label class="toggle">
+          <input
+            type="checkbox"
+            :checked="pageAllSelected"
+            :disabled="!state.conversations.length || busy"
+            @change="togglePageSelection"
+          />
+          全选本页
+        </label>
+        <span class="selection-count">已选 {{ selectedConversationCount }} 个</span>
+        <button
+          class="btn btn-sm btn-danger"
+          type="button"
+          :disabled="!selectedConversationCount || busy"
+          @click="deleteSelectedConversations"
+        >
+          <Icon name="warning" :size="14" />
+          永久删除所选会话
+        </button>
+        <button
+          class="btn btn-sm btn-ghost btn-icon"
+          type="button"
+          :disabled="!currentAccount"
+          aria-label="刷新会话列表"
+          @click="loadConversations()"
+        >
+          <Icon name="refresh" :size="15" />
+        </button>
+      </div>
     </div>
 
     <div v-if="state.conversationsBusy" class="loading-bar" />
 
     <ul v-if="state.conversations.length" class="conversation-list">
-      <li v-for="item in state.conversations" :key="item.id">
+      <li v-for="item in state.conversations" :key="item.id" class="conversation-row">
+        <label class="conversation-select" :title="'选择会话 ' + item.name">
+          <input
+            type="checkbox"
+            :checked="isConversationSelected(item.id)"
+            :disabled="busy"
+            :aria-label="'选择会话 ' + item.name"
+            @change="toggleSelect(item)"
+            @click.stop
+          />
+        </label>
         <button
           class="conversation-item"
           :class="{ 'is-active': item.id === state.conversationId }"
@@ -89,6 +158,16 @@ function choose(id) {
             <span>{{ Number(item.message_count).toLocaleString('zh-CN') }} 条</span>
             <span v-if="item.last_time">{{ shortTime(item.last_time) }}</span>
           </span>
+        </button>
+        <button
+          class="btn btn-sm btn-ghost btn-icon is-danger-text conversation-delete"
+          type="button"
+          :disabled="busy"
+          :aria-label="'永久删除会话 ' + item.name"
+          title="从 reader.sqlite 中永久删除整个会话"
+          @click.stop="removeConversation(item)"
+        >
+          <Icon name="warning" :size="14" />
         </button>
       </li>
     </ul>
@@ -103,6 +182,19 @@ function choose(id) {
             : '此账号在索引中还没有会话记录。'
         }}
       </p>
+    </div>
+
+    <div class="sidebar-foot">
+      <Pager
+        :page="conversationPage"
+        :page-count="conversationPageCount"
+        :total="state.conversationsTotal"
+        :limit="state.conversationLimit"
+        :busy="state.conversationsBusy"
+        compact
+        @change="goToConversationPage"
+        @update:limit="setConversationPageSize"
+      />
     </div>
   </aside>
 </template>

@@ -115,6 +115,13 @@ function required(search, name) {
   return value;
 }
 
+function deletionConfirmed(body) {
+  if (body.confirm_delete !== true) {
+    throw new HttpError(400, 'confirmation_required', 'Permanent deletion requires confirm_delete: true.');
+  }
+  return body;
+}
+
 async function serveStatic(req, res, distDir, pathname) {
   const relative = pathname === '/' ? 'index.html' : pathname.slice(1);
   if (!relative || relative.includes('\\') || relative.includes('\0') || relative.split('/').some(p => p === '..' || p.startsWith('.'))) {
@@ -223,7 +230,31 @@ export async function createApp({ dataDir, databasePath, token = '', distDir = D
       }
       if (pathname === '/api/messages' && method === 'GET') {
         return json(res, 200, store.listMessages(required(search, 'account'), {
-          ...queryOptions(search), conversationId: search.get('conversation') || '' }));
+          ...queryOptions(search), conversationId: search.get('conversation') || '',
+          date: search.get('date') || '' }));
+      }
+      if (pathname === '/api/calendar' && method === 'GET') {
+        return json(res, 200, store.getCalendar(required(search, 'account'), {
+          ...queryOptions(search), month: required(search, 'month'),
+          conversationId: search.get('conversation') || '' }));
+      }
+      if (pathname === '/api/message/restore' && method === 'POST') {
+        const body = await bodyJson(req);
+        return json(res, 200, { item: store.restoreMessage(required(search, 'account'),
+          required(search, 'uuid'), body.expected_revision) });
+      }
+      if (pathname === '/api/messages/delete' && method === 'POST') {
+        const body = deletionConfirmed(await bodyJson(req));
+        return json(res, 200, store.deleteMessages(required(search, 'account'), body.messages));
+      }
+      if (pathname === '/api/conversations/delete' && method === 'POST') {
+        const body = deletionConfirmed(await bodyJson(req));
+        return json(res, 200, store.deleteConversations(required(search, 'account'), body.conversations));
+      }
+      if (pathname === '/api/conversation' && method === 'DELETE') {
+        const body = deletionConfirmed(await bodyJson(req));
+        return json(res, 200, store.deleteConversation(required(search, 'account'),
+          required(search, 'conversation'), body.expected_message_count));
       }
       if (pathname === '/api/message') {
         const uid = required(search, 'account');
@@ -231,8 +262,8 @@ export async function createApp({ dataDir, databasePath, token = '', distDir = D
         if (method === 'GET') return json(res, 200, { item: store.getMessage(uid, uuid) });
         if (method === 'PATCH') return json(res, 200, { item: store.updateMessage(uid, uuid, await bodyJson(req)) });
         if (method === 'DELETE') {
-          const body = await bodyJson(req);
-          return json(res, 200, { item: store.restoreMessage(uid, uuid, body.expected_revision) });
+          const body = deletionConfirmed(await bodyJson(req));
+          return json(res, 200, store.deleteMessage(uid, uuid, body.expected_revision));
         }
       }
       if (pathname === '/api/decorations' && method === 'GET') {
@@ -312,7 +343,11 @@ async function main() {
     reindex: values.reindex });
   console.log(`Reader ready: ${app.url}`);
   console.log(`Data: ${path.resolve(values.data)}`);
-  console.log('Original exports are preserved. Reader edits are stored in reader.sqlite.');
+  console.log(`Database: ${app.store.databasePath}`);
+  console.log(`Frontend: ${DEFAULT_DIST}`);
+  console.log(`Backend: ${fileURLToPath(import.meta.url)}`);
+  console.log(`Media: ${path.join(path.resolve(values.data), 'attachments')}`);
+  console.log('Edits and permanent deletions apply to the reader database. Original export files are preserved.');
   let shuttingDown = false;
   for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, async () => {
     if (shuttingDown) {

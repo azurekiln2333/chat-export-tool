@@ -1,30 +1,37 @@
 <script setup>
 /**
- * Message pane: title, search (conversation or whole account), hidden toggle,
- * message list and bounded pagination.
+ * Message pane: title, search (conversation or whole account), day filter,
+ * calendar, selection, batch deletion, message list and bounded pagination.
  */
 import { computed, ref, watch } from 'vue';
 
 import Icon from './Icon.vue';
 import MessageItem from './MessageItem.vue';
+import MonthCalendar from './MonthCalendar.vue';
 import Pager from './Pager.vue';
 import {
+  clearMessageDate,
+  clearSelection,
   currentAccount,
   currentConversation,
+  deleteSelectedMessages,
   goToMessagePage,
   loadMessages,
   messagePage,
   messagePageCount,
+  pageAllMessagesSelected,
   searchAccountMessages,
   searchConversationMessages,
-  selectConversation,
+  selectedMessageCount,
   setIncludeHidden,
   setMessagePageSize,
   state,
+  togglePageMessageSelection,
 } from '../store.js';
 import { debounce } from '../utils.js';
 
 const query = ref(state.messageQuery);
+const calendarOpen = ref(false);
 
 const runSearch = debounce((value) => {
   if (state.conversationId) searchConversationMessages(value);
@@ -54,6 +61,7 @@ const subtitle = computed(() => {
 });
 
 const showSearchScopeHint = computed(() => Boolean(state.messageQuery) && !state.conversationId);
+const busy = computed(() => state.deleting);
 
 function clearSearch() {
   query.value = '';
@@ -63,10 +71,6 @@ function clearSearch() {
 
 function searchWholeAccount() {
   searchAccountMessages(query.value);
-}
-
-function backToConversation() {
-  if (currentConversation.value) selectConversation(currentConversation.value.id);
 }
 
 function toggleHidden(event) {
@@ -80,6 +84,13 @@ function toggleHidden(event) {
       <div class="reader-title">
         <h2>{{ title }}</h2>
         <span class="sub">{{ subtitle }}</span>
+        <span v-if="state.messageDate" class="date-chip">
+          <Icon name="list" :size="13" />
+          {{ state.messageDate }}
+          <button class="date-chip-clear" type="button" aria-label="清除日期筛选" @click="clearMessageDate">
+            <Icon name="close" :size="12" />
+          </button>
+        </span>
         <button
           v-if="!state.conversationId && state.messageQuery"
           class="btn btn-sm btn-ghost"
@@ -115,15 +126,16 @@ function toggleHidden(event) {
           <Icon name="search" :size="14" />
           在整个账号中搜索
         </button>
+
         <button
-          v-else-if="state.messageQuery"
           class="btn btn-sm"
+          :class="{ 'btn-primary': calendarOpen }"
           type="button"
-          :disabled="!currentConversation"
-          @click="backToConversation"
+          :aria-expanded="calendarOpen ? 'true' : 'false'"
+          @click="calendarOpen = !calendarOpen"
         >
           <Icon name="list" :size="14" />
-          回到会话
+          按日期浏览
         </button>
 
         <label class="toggle">
@@ -142,9 +154,42 @@ function toggleHidden(event) {
         </button>
       </div>
 
+      <div class="selection-bar">
+        <label class="toggle">
+          <input
+            type="checkbox"
+            :checked="pageAllMessagesSelected"
+            :disabled="!state.messages.length || busy"
+            @change="togglePageMessageSelection"
+          />
+          全选本页
+        </label>
+        <span class="selection-count">已选 {{ selectedMessageCount }} 条</span>
+        <button
+          class="btn btn-sm btn-danger"
+          type="button"
+          :disabled="!selectedMessageCount || busy"
+          @click="deleteSelectedMessages"
+        >
+          <Icon name="warning" :size="14" />
+          永久删除所选
+        </button>
+        <button
+          class="btn btn-sm btn-ghost"
+          type="button"
+          :disabled="!selectedMessageCount || busy"
+          @click="clearSelection"
+        >
+          取消选择
+        </button>
+        <span class="editor-hint">可跨页选择同一查询范围内的消息。</span>
+      </div>
+
       <p v-if="showSearchScopeHint" class="editor-hint">
         正在整个账号中搜索{{ state.messageQuery ? '「' + state.messageQuery + '」' : '' }}。
       </p>
+
+      <MonthCalendar v-if="calendarOpen" />
     </div>
 
     <div v-if="state.messagesBusy" class="loading-bar" />
@@ -171,20 +216,33 @@ function toggleHidden(event) {
           {{
             state.messageQuery
               ? '没有匹配的消息'
-              : state.conversationId
-                ? '此会话没有消息'
-                : '请选择左侧会话'
+              : state.messageDate
+                ? '这一天没有消息'
+                : state.conversationId
+                  ? '此会话没有消息'
+                  : '请选择左侧会话'
           }}
         </h3>
         <p>
           {{
             state.messageQuery
               ? '搜索会同时匹配原始正文、编辑后的正文和备注。'
-              : state.conversationId
-                ? '该会话在索引中没有可显示的消息记录。'
-                : '选择一个会话查看消息，或直接搜索整个账号。'
+              : state.messageDate
+                ? '可以清除日期筛选，或选择日历中有记录的日期。'
+                : state.conversationId
+                  ? '该会话在索引中没有可显示的消息记录。'
+                  : '选择一个会话查看消息，或直接搜索整个账号。'
           }}
         </p>
+        <button
+          v-if="state.messageDate"
+          class="btn btn-sm"
+          type="button"
+          @click="clearMessageDate"
+        >
+          <Icon name="close" :size="14" />
+          清除日期筛选
+        </button>
       </div>
     </div>
 

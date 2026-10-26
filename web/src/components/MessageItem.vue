@@ -12,7 +12,15 @@ import Icon from './Icon.vue';
 import MediaBlock from './MediaBlock.vue';
 import RawDetail from './RawDetail.vue';
 import { describeMessage } from '../message-model.js';
-import { clearConflict, restoreMessage, saveMessage, state } from '../store.js';
+import {
+  clearConflict,
+  deleteMessagePermanently,
+  isMessageSelected,
+  restoreMessage,
+  saveMessage,
+  state,
+  toggleMessageSelection,
+} from '../store.js';
 import { kindFromPath } from '../utils.js';
 
 const props = defineProps({
@@ -57,6 +65,18 @@ const edited = computed(() => model.value.flags.edited);
 const hasNote = computed(() => model.value.flags.note);
 const isModified = computed(() => model.value.flags.modified);
 const conflict = computed(() => state.conflicts[props.message.msg_uuid]);
+const selected = computed(() => isMessageSelected(props.message.msg_uuid));
+const busy = computed(() => state.deleting);
+
+function toggleSelect() {
+  toggleMessageSelection(props.message.msg_uuid, edit.value.revision);
+}
+
+async function removePermanently() {
+  await deleteMessagePermanently(props.message.msg_uuid, edit.value.revision, {
+    conversationName: props.message.conversation_name || '',
+  });
+}
 
 function basename(path) {
   return String(path || '').split('/').pop() || '附件';
@@ -140,6 +160,15 @@ watch(
 <template>
   <article class="message" :class="{ own, 'is-hidden': hidden }">
     <header class="message-header">
+      <label class="message-select" :title="selected ? '取消选择此消息' : '选择此消息以批量删除'">
+        <input
+          type="checkbox"
+          :checked="selected"
+          :disabled="busy"
+          :aria-label="`选择消息 ${message.msg_uuid}`"
+          @change="toggleSelect"
+        />
+      </label>
       <strong>{{ message.sender_name }}</strong>
       <span class="message-time">{{ message.time }}</span>
       <span class="badge">{{ message.type_name }}</span>
@@ -205,7 +234,7 @@ watch(
         <Icon :name="editorOpen ? 'close' : 'edit'" :size="14" />
         {{ editorOpen ? '取消编辑' : '编辑' }}
       </button>
-      <button class="btn btn-sm btn-ghost" type="button" :disabled="saving" @click="toggleHidden">
+      <button class="btn btn-sm btn-ghost" type="button" :disabled="busy" @click="toggleHidden">
         <Icon :name="hidden ? 'show' : 'hide'" :size="14" />
         {{ hidden ? '取消隐藏' : '隐藏' }}
       </button>
@@ -213,11 +242,21 @@ watch(
         v-if="isModified"
         class="btn btn-sm btn-ghost"
         type="button"
-        :disabled="saving"
+        :disabled="saving || busy"
         @click="restore"
       >
         <Icon name="restore" :size="14" />
         恢复原文
+      </button>
+      <button
+        class="btn btn-sm btn-ghost is-danger-text"
+        type="button"
+        :disabled="busy"
+        title="从 reader.sqlite 中永久删除这条消息"
+        @click="removePermanently"
+      >
+        <Icon name="warning" :size="14" />
+        永久删除
       </button>
 
       <RawDetail class="message-extra" :message="message" />

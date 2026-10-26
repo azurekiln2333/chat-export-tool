@@ -1058,6 +1058,331 @@ pre.raw {
   gap: 12px;
 }
 
+/* ------------------------------------------------ selection & destructive UI */
+.selection-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0 2px;
+}
+
+.selection-count {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.btn-danger-solid {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+
+.btn-danger-solid:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 84%, #000);
+  border-color: color-mix(in srgb, var(--danger) 84%, #000);
+}
+
+.is-danger-text {
+  color: var(--danger);
+}
+
+.is-danger-text:hover:not(:disabled) {
+  background: var(--danger-soft);
+}
+
+.message-select,
+.conversation-select {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+
+.message-select {
+  margin-right: 2px;
+}
+
+.conversation-select {
+  padding-left: 6px;
+}
+
+.message-select input,
+.conversation-select input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.message.is-hidden {
+  opacity: 0.62;
+}
+
+.conversation-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  border-radius: var(--radius-sm);
+}
+
+.conversation-row:hover {
+  background: var(--surface-2);
+}
+
+.conversation-row .conversation-item {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.conversation-row .conversation-item:hover {
+  background: transparent;
+}
+
+.conversation-row .conversation-item.is-active {
+  background: var(--accent-soft);
+}
+
+.conversation-delete {
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.conversation-row:hover .conversation-delete,
+.conversation-delete:focus-visible {
+  opacity: 1;
+}
+
+.sidebar-foot {
+  border-top: 1px solid var(--border);
+  padding: 8px 10px;
+}
+
+.sidebar-foot .pager {
+  gap: 4px;
+  font-size: 12px;
+}
+
+.pager.is-compact .pager-info + .pager-info {
+  display: none;
+}
+
+/* ----------------------------------------------------------------- calendar */
+.calendar {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  padding: 10px 12px;
+}
+
+.calendar-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.calendar-month {
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+  min-width: 96px;
+  text-align: center;
+}
+
+.calendar-spacer {
+  margin-left: auto;
+}
+
+.calendar-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.calendar-weekday {
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-soft);
+  padding: 2px 0;
+}
+
+.calendar-day {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  min-height: 44px;
+  padding: 3px 2px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-soft);
+  font-size: 12.5px;
+  cursor: default;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.calendar-day.is-empty {
+  visibility: hidden;
+}
+
+.calendar-day.has-records {
+  cursor: pointer;
+  color: var(--text);
+  background: var(--surface-2);
+  border-color: var(--border);
+}
+
+.calendar-day.has-records:hover {
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.calendar-day.is-selected {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.calendar-day.is-selected .calendar-day-count {
+  color: #fff;
+  opacity: 0.92;
+}
+
+.calendar-day:disabled {
+  opacity: 0.55;
+}
+
+.calendar-day-number {
+  font-variant-numeric: tabular-nums;
+}
+
+.calendar-day-count {
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--accent-strong);
+}
+
+.calendar-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+.calendar-foot .editor-hint {
+  margin-right: auto;
+}
+
+/* ---------------------------------------------------------------- date chip */
+.date-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 6px 2px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-size: 12px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.date-chip-clear {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  padding: 2px;
+  line-height: 0;
+  border-radius: 50%;
+}
+
+.date-chip-clear:hover {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+/* ------------------------------------------------------------------- modal */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(12, 18, 28, 0.5);
+  backdrop-filter: blur(2px);
+}
+
+.modal {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(520px, 100%);
+  max-height: calc(100vh - 40px);
+  overflow: auto;
+  padding: 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-lg);
+}
+
+.modal.is-danger {
+  border-top: 3px solid var(--danger);
+}
+
+.modal-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.modal-head h2 {
+  font-size: 17px;
+}
+
+.modal-icon {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.modal-icon.is-danger {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.modal-message {
+  margin: 0;
+  font-size: 14.5px;
+  font-weight: 650;
+}
+
+.modal-detail {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: var(--text-muted);
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
 /* -------------------------------------------------------------- responsive */
 @media (max-width: 640px) {
   .hide-sm {
@@ -1090,6 +1415,15 @@ pre.raw {
 
   .reader-head {
     padding: 10px 12px;
+  }
+
+  /* Hover is unavailable on touch devices, so destructive buttons stay visible. */
+  .conversation-delete {
+    opacity: 1;
+  }
+
+  .calendar-day {
+    min-height: 38px;
   }
 
   .reader-scroll {

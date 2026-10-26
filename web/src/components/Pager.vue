@@ -10,6 +10,7 @@ const props = defineProps({
   total: { type: Number, default: 0 },
   limit: { type: Number, required: true },
   busy: { type: Boolean, default: false },
+  compact: { type: Boolean, default: false },
 });
 
 const emit = defineEmits(['change', 'update:limit']);
@@ -49,7 +50,7 @@ function changeLimit(event) {
 </script>
 
 <template>
-  <div class="pager">
+  <div class="pager" :class="{ 'is-compact': compact }">
     <button class="btn btn-sm btn-ghost" type="button" :disabled="!canPrev" aria-label="第一页" @click="go(1)">
       <Icon name="chevrons-left" :size="15" />
     </button>
@@ -79,23 +80,25 @@ function changeLimit(event) {
       <Icon name="chevrons-right" :size="15" />
     </button>
 
-    <span class="spacer" />
+    <span class="spacer" v-if="!compact" />
 
-    <label class="pager-info" for="pager-jump">跳至</label>
-    <input
-      id="pager-jump"
-      v-model="jump"
-      class="input"
-      style="width: 64px; padding: 5px 8px; font-size: 13px"
-      inputmode="numeric"
-      @keydown.enter.prevent="submitJump"
-      @blur="submitJump"
-    />
-    <span class="pager-info">页</span>
+    <template v-if="!compact">
+      <label class="pager-info" for="pager-jump">跳至</label>
+      <input
+        id="pager-jump"
+        v-model="jump"
+        class="input"
+        style="width: 64px; padding: 5px 8px; font-size: 13px"
+        inputmode="numeric"
+        @keydown.enter.prevent="submitJump"
+        @blur="submitJump"
+      />
+      <span class="pager-info">页</span>
 
-    <label class="pager-info" for="pager-size">每页</label>
-    <select id="pager-size" class="select" :value="limit" @change="changeLimit">
-      <option v-for="size in PAGE_SIZES" :key="size" :value="size">{{ size }} 条</option>
-    </select>
+      <label class="pager-info" for="pager-size">每页</label>
+      <select id="pager-size" class="select" :value="limit" @change="changeLimit">
+        <option v-for="size in PAGE_SIZES" :key="size" :value="size">{{ size }} 条</option>
+      </select>
+    </template>
   </div>
 </template>

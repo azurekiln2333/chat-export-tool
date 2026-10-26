@@ -14,7 +14,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import {
-  ACCOUNT_A, CONVERSATION_A, UUID, BIG_SERVER_ID, MEDIA, makeExport,
+  ACCOUNT_A, ACCOUNT_B, CONVERSATION_A, CONVERSATION_C, UUID, BIG_SERVER_ID, MEDIA, makeExport,
 } from './helpers/fixture.mjs';
 import {
   Client, bodyOf, errorShape, openStalledMedia, rawRequest, startTestApp,
@@ -35,8 +35,8 @@ function writeDist() {
   return dist;
 }
 
-async function boot(t, { token = TOKEN } = {}) {
-  const fixture = makeExport();
+async function boot(t, { token = TOKEN, fixture: fixtureOptions = {} } = {}) {
+  const fixture = makeExport(fixtureOptions);
   const dist = writeDist();
   let app;
   try {
@@ -229,7 +229,7 @@ test('edits require CSRF, bump the revision and detect conflicts', async (t) => 
   assert.ok(revealed.data.items.some((item) => item.msg_uuid === UUID.text));
 });
 
-test('DELETE restores the original and advances the revision', async (t) => {
+test('POST api/message/restore restores the original and advances the revision', async (t) => {
   const context = await boot(t);
   await authenticate(t, context);
 
@@ -238,7 +238,10 @@ test('DELETE restores the original and advances the revision', async (t) => {
     method: 'PATCH', body: { text_override: 'edited', note: 'x', hidden: true, expected_revision: 0 },
   });
 
-  const restored = await context.client.json(url, { method: 'DELETE', body: { expected_revision: 1 } });
+  const restored = await context.client.json(
+    `/api/message/restore?account=${ACCOUNT_A}&uuid=${UUID.text}`,
+    { method: 'POST', body: { expected_revision: 1 } },
+  );
   assert.equal(restored.response.status, 200);
   assert.equal(restored.data.item.text, 'hello [smile] world');
   assert.equal(restored.data.item.edit.text_override, null);
@@ -528,4 +531,264 @@ test('shutdown bounds a stalled media connection and releases SQLite', { timeout
   const database = path.join(context.fixture.dir, 'reader.sqlite');
   fs.renameSync(database, database + '.closed');
   fs.renameSync(database + '.closed', database);
+});
+
+/** Every permanent write exposed by the design; used for the auth matrix. */
+function permanentWrites() {
+  return [
+    {
+      label: 'message single',
+      method: 'DELETE',
+      path: `/api/message?account=${ACCOUNT_A}&uuid=${UUID.text}`,
+      body: { confirm_delete: true, expected_revision: 0 },
+    },
+    {
+      label: 'message batch',
+      method: 'POST',
+      path: `/api/messages/delete?account=${ACCOUNT_A}`,
+      body: { confirm_delete: true, messages: [{ msg_uuid: UUID.text, expected_revision: 0 }] },
+    },
+    {
+      label: 'conversation single',
+      method: 'DELETE',
+      path: `/api/conversation?account=${ACCOUNT_A}&conversation=${encodeURIComponent(CONVERSATION_A)}`,
+      body: { confirm_delete: true, expected_message_count: 7 },
+    },
+    {
+      label: 'conversation batch',
+      method: 'POST',
+      path: `/api/conversations/delete?account=${ACCOUNT_A}`,
+      body: {
+        confirm_delete: true,
+        conversations: [{ id: CONVERSATION_A, expected_message_count: 7 }],
+      },
+    },
+    {
+      label: 'restore',
+      method: 'POST',
+      path: `/api/message/restore?account=${ACCOUNT_A}&uuid=${UUID.text}`,
+      body: { expected_revision: 0 },
+    },
+  ];
+}
+
+test('DELETE api/message without confirm_delete fails safely', async (t) => {
+  const context = await boot(t);
+  await authenticate(t, context);
+  const url = `/api/message?account=${ACCOUNT_A}&uuid=${UUID.text}`;
+
+  for (const body of [{ expected_revision: 0 }, { confirm_delete: false, expected_revision: 0 },
+    { confirm_delete: 'true', expected_revision: 0 }, {}]) {
+    const response = await context.client.json(url, { method: 'DELETE', body });
+    assert.equal(response.response.status, 400, `body ${JSON.stringify(body)} was accepted`);
+    assert.equal(response.data.error.code, 'confirmation_required');
+  }
+
+  // The message must still be readable, editable and restorable afterwards.
+  const kept = await context.client.json(url);
+  assert.equal(kept.response.status, 200);
+  assert.equal(kept.data.item.text, 'hello [smile] world');
+  assert.equal(kept.data.item.edit.revision, 0);
+
+  const edited = await context.client.json(url, {
+    method: 'PATCH', body: { note: 'still editable', expected_revision: 0 },
+  });
+  assert.equal(edited.response.status, 200);
+
+  const restored = await context.client.json(
+    `/api/message/restore?account=${ACCOUNT_A}&uuid=${UUID.text}`,
+    { method: 'POST', body: { expected_revision: 1 } },
+  );
+  assert.equal(restored.response.status, 200);
+  assert.equal(restored.data.item.edit.note, null);
+
+  const list = await context.client.json(
+    `/api/messages?account=${ACCOUNT_A}&conversation=${encodeURIComponent(CONVERSATION_A)}&limit=500`);
+  assert.equal(list.data.total, 7);
+});
+
+test('DELETE api/message with confirmation deletes permanently', async (t) => {
+  const context = await boot(t);
+  await authenticate(t, context);
+  const url = `/api/message?account=${ACCOUNT_A}&uuid=${UUID.text}`;
+
+  const deleted = await context.client.json(url, {
+    method: 'DELETE', body: { confirm_delete: true, expected_revision: 0 },
+  });
+  assert.equal(deleted.response.status, 200);
+  assert.equal(deleted.data.deleted, true);
+  assert.equal(deleted.data.account_uid, ACCOUNT_A);
+  assert.equal(deleted.data.msg_uuid, UUID.text);
+  assert.deepEqual(deleted.data.msg_uuids, [UUID.text]);
+  assert.equal(deleted.data.deleted_messages, 1);
+
+  assert.equal((await context.client.json(url)).response.status, 404);
+  const list = await context.client.json(
+    `/api/messages?account=${ACCOUNT_A}&conversation=${encodeURIComponent(CONVERSATION_A)}&limit=500`);
+  assert.equal(list.data.total, 6);
+  assert.ok(!list.data.items.some((item) => item.msg_uuid === UUID.text));
+});
+
+test('batch message deletion over HTTP is atomic and validated', async (t) => {
+  const context = await boot(t);
+  await authenticate(t, context);
+  const path = '/api/messages/delete?account=' + ACCOUNT_A;
+
+  const noConfirm = await context.client.json(path, {
+    method: 'POST', body: { messages: [{ msg_uuid: UUID.text, expected_revision: 0 }] },
+  });
+  assert.equal(noConfirm.response.status, 400);
+  assert.equal(noConfirm.data.error.code, 'confirmation_required');
+
+  const stale = await context.client.json(path, {
+    method: 'POST',
+    body: {
+      confirm_delete: true,
+      messages: [{ msg_uuid: UUID.text, expected_revision: 0 },
+        { msg_uuid: UUID.formula, expected_revision: 9 }],
+    },
+  });
+  assert.equal(stale.response.status, 409);
+  assert.ok(errorShape(stale.data));
+
+  const empty = await context.client.json(path, {
+    method: 'POST', body: { confirm_delete: true, messages: [] },
+  });
+  assert.equal(empty.response.status, 400);
+
+  const untouched = await context.client.json(
+    `/api/messages?account=${ACCOUNT_A}&limit=500`);
+  assert.equal(untouched.data.total, 7, 'a rejected batch deleted messages');
+
+  const ok = await context.client.json(path, {
+    method: 'POST',
+    body: {
+      confirm_delete: true,
+      messages: [{ msg_uuid: UUID.text, expected_revision: 0 },
+        { msg_uuid: UUID.formula, expected_revision: 0 }],
+    },
+  });
+  assert.equal(ok.response.status, 200);
+  assert.equal(ok.data.deleted_messages, 2);
+  assert.deepEqual([...ok.data.msg_uuids].sort(), [UUID.text, UUID.formula].sort());
+
+  const after = await context.client.json(`/api/messages?account=${ACCOUNT_A}&limit=500`);
+  assert.equal(after.data.total, 5);
+});
+
+test('conversation deletion works singly and in batches over HTTP', async (t) => {
+  const context = await boot(t, { fixture: { dated: true } });
+  await authenticate(t, context);
+
+  const conversations = await context.client.json(`/api/conversations?account=${ACCOUNT_A}&limit=50`);
+  assert.equal(conversations.data.total, 2);
+
+  const stale = await context.client.json(
+    `/api/conversation?account=${ACCOUNT_A}&conversation=${encodeURIComponent(CONVERSATION_A)}`,
+    { method: 'DELETE', body: { confirm_delete: true, expected_message_count: 999 } },
+  );
+  assert.equal(stale.response.status, 409);
+  assert.equal((await context.client.json(`/api/conversations?account=${ACCOUNT_A}&limit=50`))
+    .data.total, 2, 'a stale conversation delete removed data');
+
+  const batch = await context.client.json('/api/conversations/delete?account=' + ACCOUNT_A, {
+    method: 'POST',
+    body: { confirm_delete: true, conversations: [{ id: CONVERSATION_C, expected_message_count: 2 }] },
+  });
+  assert.equal(batch.response.status, 200);
+  assert.equal(batch.data.deleted_conversations, 1);
+  assert.equal(batch.data.deleted_messages, 2);
+  assert.deepEqual(batch.data.conversation_ids, [CONVERSATION_C]);
+
+  const single = await context.client.json(
+    `/api/conversation?account=${ACCOUNT_A}&conversation=${encodeURIComponent(CONVERSATION_A)}`,
+    { method: 'DELETE', body: { confirm_delete: true, expected_message_count: 14 } },
+  );
+  assert.equal(single.response.status, 200);
+  assert.equal(single.data.conversation_id, CONVERSATION_A);
+  assert.equal(single.data.deleted_messages, 14);
+
+  const remaining = await context.client.json(`/api/conversations?account=${ACCOUNT_A}&limit=50`);
+  assert.equal(remaining.data.total, 0);
+  const messages = await context.client.json(`/api/messages?account=${ACCOUNT_A}&limit=500`);
+  assert.equal(messages.data.total, 0);
+  // The other account keeps its own conversation and message.
+  assert.equal((await context.client.json(`/api/messages?account=${ACCOUNT_B}&limit=500`)).data.total, 1);
+});
+
+test('GET api/calendar and the date filter are exposed over HTTP', async (t) => {
+  const context = await boot(t, { fixture: { dated: true } });
+  await authenticate(t, context);
+
+  const february = await context.client.json(
+    `/api/calendar?account=${ACCOUNT_A}&month=2024-02`);
+  assert.equal(february.response.status, 200);
+  assert.equal(february.data.month, '2024-02');
+  assert.equal(february.data.timezone, 'Asia/Shanghai');
+  assert.equal(february.data.total, 4);
+  assert.deepEqual(february.data.days, [
+    { date: '2024-02-28', message_count: 1 },
+    { date: '2024-02-29', message_count: 3 },
+  ]);
+  assert.equal(february.data.first_date, '2023-12-31');
+  assert.equal(february.data.last_date, '2026-10-27');
+
+  const scoped = await context.client.json(
+    `/api/calendar?account=${ACCOUNT_A}&month=2024-03&conversation=${encodeURIComponent(CONVERSATION_C)}`);
+  assert.equal(scoped.data.total, 2);
+  assert.deepEqual(scoped.data.days, [{ date: '2024-03-02', message_count: 2 }]);
+
+  assert.equal((await context.client.json('/api/calendar?account=' + ACCOUNT_A)).response.status, 400);
+  assert.equal((await context.client.json(
+    `/api/calendar?account=${ACCOUNT_A}&month=2024-13`)).response.status, 400);
+
+  const day = await context.client.json(
+    `/api/messages?account=${ACCOUNT_A}&date=2024-02-29&limit=500`);
+  assert.equal(day.response.status, 200);
+  assert.equal(day.data.total, 3);
+
+  const page = await context.client.json(
+    `/api/messages?account=${ACCOUNT_A}&date=2024-02-29&limit=1&offset=2`);
+  assert.equal(page.data.total, 3);
+  assert.equal(page.data.items.length, 1);
+
+  assert.equal((await context.client.json(
+    `/api/messages?account=${ACCOUNT_A}&date=2024-02-30`)).response.status, 400);
+  assert.equal((await context.client.json(
+    `/api/messages?account=${ACCOUNT_A}&date=2024-2-9`)).response.status, 400);
+});
+
+test('every permanent write requires a session, CSRF and a matching Origin', async (t) => {
+  const context = await boot(t);
+  await authenticate(t, context);
+  const anonymous = new Client(context.baseUrl);
+
+  for (const entry of permanentWrites()) {
+    const withoutSession = await anonymous.json(entry.path, {
+      method: entry.method, body: entry.body, csrf: false,
+    });
+    assert.equal(withoutSession.response.status, 401, `${entry.label}: reachable without a session`);
+    assert.ok(errorShape(withoutSession.data), `${entry.label}: missing error shape`);
+
+    const withoutCsrf = await context.client.json(entry.path, {
+      method: entry.method, body: entry.body, csrf: false,
+    });
+    assert.equal(withoutCsrf.response.status, 403, `${entry.label}: accepted without CSRF`);
+    assert.equal(withoutCsrf.data.error.code, 'csrf_rejected', `${entry.label}: wrong code`);
+
+    const wrongOrigin = await context.client.json(entry.path, {
+      method: entry.method, body: entry.body, headers: { origin: 'http://evil.invalid' },
+    });
+    assert.equal(wrongOrigin.response.status, 403, `${entry.label}: accepted cross-origin`);
+    assert.equal(wrongOrigin.data.error.code, 'origin_rejected', `${entry.label}: wrong code`);
+  }
+
+  // Nothing may have been deleted or restored by any rejected request.
+  const list = await context.client.json(`/api/messages?account=${ACCOUNT_A}&limit=500`);
+  assert.equal(list.data.total, 7);
+  const message = await context.client.json(
+    `/api/message?account=${ACCOUNT_A}&uuid=${UUID.text}`);
+  assert.equal(message.data.item.edit.revision, 0);
+  assert.equal((await context.client.json(`/api/conversations?account=${ACCOUNT_A}&limit=50`))
+    .data.total, 1);
 });

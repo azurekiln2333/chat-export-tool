@@ -47,3 +47,106 @@ awaits server closure before removing fixture directories.
 Keep real-data probes outside the repository and report only aggregate
 counts. Verify directory migration, media bytes/ranges, original file hashes,
 and the production build separately from any visual browser inspection.
+
+## Permanent deletion and calendar contracts
+
+### 1. Scope / Trigger
+
+Reader version 0.2.0 adds permanent single/batch SQL deletion and a month
+calendar. Schema version 3 must upgrade existing reader databases without
+JSONL present. Original per-account SQLite/JSONL and shared media are untouched.
+
+### 2. Signatures
+
+```js
+deleteMessage(uid, uuid, expectedRevision)
+deleteMessages(uid, [{ msg_uuid, expected_revision }])
+deleteConversation(uid, id, expectedMessageCount)
+deleteConversations(uid, [{ id, expected_message_count }])
+getCalendar(uid, { month, conversationId = '', q = '', includeHidden = false })
+listMessages(uid, { date = '', conversationId, q, includeHidden, limit, offset })
+```
+
+Schema adds indexed `messages.day` and
+`deletions(kind, key_hash, deleted_at)` with primary key `(kind,key_hash)`.
+The ledger holds only domain-separated SHA-256 hashes of
+`kind + '\0' + JSON.stringify([uid,key])`, with no deleted text, raw JSON,
+names or plaintext identifiers. Keep it through migrations and imports.
+
+### 3. Contracts
+
+| HTTP method and endpoint | Body / query |
+| --- | --- |
+| `DELETE api/message?account=UID&uuid=UUID` | `{confirm_delete:true,expected_revision}` |
+| `DELETE api/conversation?account=UID&conversation=ID` | `{confirm_delete:true,expected_message_count}` |
+| `POST api/messages/delete?account=UID` | `{confirm_delete:true,messages:[{msg_uuid,expected_revision}]}` |
+| `POST api/conversations/delete?account=UID` | `{confirm_delete:true,conversations:[{id,expected_message_count}]}` |
+| `POST api/message/restore?account=UID&uuid=UUID` | `{expected_revision}`; restores annotation only |
+| `GET api/calendar` | `account,month=YYYY-MM,conversation?,q?,include_hidden?` |
+| `GET api/messages` | Existing scope/pagination plus optional `date=YYYY-MM-DD` |
+
+Deletion returns top-level `{deleted:true,account_uid,deleted_messages,
+deleted_conversations}` plus `msg_uuids` or `conversation_ids`. Single wrappers
+also return `msg_uuid` or `conversation_id`. Calendar returns
+`{month,timezone,days:[{date,message_count}],total,first_date,last_date}`.
+Empty calendar bounds are null. Counts/bounds follow account, conversation,
+effective text/notes search and hidden scope; bounds span all matching months.
+
+Delete messages, raw JSON and corresponding edits in one transaction. Validate
+every batch item before mutating; refresh conversation count/time and
+remove empty conversations. Whole-conversation deletion includes hidden rows.
+An empty account remains valid. SQL deletion has no content recycle bin.
+`secure_delete` and post-commit WAL truncation are best effort; a purge failure
+must never turn a committed delete into an error response.
+
+Use valid exported `time` date prefixes first; timestamp fallback takes
+**milliseconds** and uses the export timezone. Include `export_summary.json`
+in source fingerprints, clear timezone/formatter caches on initialize, and
+persist the resolved zone in `store_meta`. Without summary use stored zone,
+then exported row metadata, then UTC. A changed zone recomputes fallback days.
+Undated messages remain visible without a date filter.
+
+Migrate columns, backfill, indexes and version/zone markers atomically. Close
+the handle on constructor failure. A completed-import marker, rather than a
+nonzero message count, determines whether an unchanged import can be skipped.
+Deleting `reader.sqlite` also loses edit/deletion suppression; original records
+can then be imported again. Back up the working database as well as originals.
+
+### 4. Validation & Error Matrix
+
+| Condition | Result |
+| --- | --- |
+| Missing/non-boolean-true `confirm_delete` | 400 `confirmation_required`; no deletion |
+| Empty, duplicate, >500 or malformed batch | 400 `invalid_batch` or `invalid_argument` |
+| Invalid month/day, including impossible leap dates | 400 `invalid_argument` |
+| Unknown account/message/conversation | 404 `not_found` |
+| Stale message revision or conversation count | 409 `conflict`; whole batch unchanged |
+| Missing login / invalid CSRF or Origin | Existing 401 / 403 contract |
+
+### 5. Good / Base / Bad Cases
+
+- Good: delete a selected batch, reimport changed JSONL, and deleted rows stay
+  absent while surviving annotations keep revisions.
+- Base: an empty recorded month returns `days:[]` and `total:0`; dayless rows
+  remain accessible through the unfiltered paginated list.
+- Bad: interpreting the old DELETE restore payload as deletion, dropping tables
+  during upgrade, or preserving deleted contents in an auxiliary table.
+
+### 6. Tests Required
+
+`delete.test.mjs` independently inspects SQL rows, edits, raw content and hash
+ledger; asserts atomic conflicts, account isolation, reindex/reopen suppression
+and index-only upgrades. `calendar.test.mjs` asserts exact buckets, export
+timezone, search/hidden/conversation scope and day pagination. `http.test.mjs`
+asserts all routes and confirmation/session/CSRF/Origin rejection. Frontend
+tests cover selection, confirmations, scope races and authoritative refresh.
+Real-scale upgrade probes use isolated snapshots and aggregate reports only.
+
+### 7. Wrong vs Correct
+
+Wrong: `DELETE api/message` with only `expected_revision` restores or removes
+content depending on frontend age. Correct: restore uses its explicit POST
+route, while permanent DELETE always requires `confirm_delete:true`.
+
+Wrong: add `day`, commit, then backfill. Correct: add/backfill/update markers
+in one transaction so an interrupted upgrade retries cleanly.

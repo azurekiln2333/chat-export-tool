@@ -25,8 +25,11 @@ export const ACCOUNT_A = '8100000000000011';
 export const ACCOUNT_B = '8210000000000022';
 export const PEER_A = '7300000000000044';
 export const PEER_B = '7300000000000055';
+export const PEER_C = '8130000000000033';
 export const CONVERSATION_A = `0:1:${ACCOUNT_A}:${PEER_A}`;
 export const CONVERSATION_B = `0:1:${ACCOUNT_B}:${PEER_B}`;
+/** Second account-A conversation, present only when `dated: true` is used. */
+export const CONVERSATION_C = `0:1:${ACCOUNT_A}:${PEER_C}`;
 
 export const UUID = {
   text: 'aaaaaaaa-0000-4000-8000-000000000001',
@@ -37,6 +40,16 @@ export const UUID = {
   huge: 'aaaaaaaa-0000-4000-8000-000000000006',
   unavailable: 'aaaaaaaa-0000-4000-8000-000000000007',
   conversationB: 'bbbbbbbb-0000-4000-8000-000000000001',
+  // Only present when an export is built with `dated: true`.
+  datedLeapA: 'aaaaaaaa-0000-4000-8000-000000000101',
+  datedLeapB: 'aaaaaaaa-0000-4000-8000-000000000102',
+  datedFeb28: 'aaaaaaaa-0000-4000-8000-000000000103',
+  datedMar01: 'aaaaaaaa-0000-4000-8000-000000000104',
+  datedDec31: 'aaaaaaaa-0000-4000-8000-000000000105',
+  timezoneProbe: 'aaaaaaaa-0000-4000-8000-000000000106',
+  undated: 'aaaaaaaa-0000-4000-8000-000000000107',
+  conversationC1: 'cccccccc-0000-4000-8000-000000000001',
+  conversationC2: 'cccccccc-0000-4000-8000-000000000002',
 };
 
 // 2^53 + 1 and a 19-digit index: both are unsafe as JavaScript numbers.
@@ -90,7 +103,8 @@ function writeJson(root, relative, value) {
 
 function messageRow({ uuid, conversationId, conversationName, sender, senderName, created,
                       type, typeName, content, serverId, orderIndex, ext = '{}',
-                      deleted = 0, localMedia = [], media = null, bubble = null }) {
+                      deleted = 0, localMedia = [], media = null, bubble = null,
+                      time = '2026-10-27 12:00:00', timeZone = 'Asia/Shanghai' }) {
   const accountUid = conversationId.split(':')[2] || '';
   const row = {
     msg_uuid: uuid,
@@ -116,8 +130,8 @@ function messageRow({ uuid, conversationId, conversationName, sender, senderName
   const meta = {
     account_uid: String(accountUid),
     conversation_name: conversationName,
-    time: '2026-10-27 12:00:00',
-    timezone: 'Asia/Shanghai',
+    time,
+    timezone: timeZone,
     sender_name: senderName,
     type_name: typeName,
     text: typeof content?.text === 'string' ? content.text : `[${typeName}]`,
@@ -136,7 +150,14 @@ function messageRow({ uuid, conversationId, conversationName, sender, senderName
 }
 
 /** Build a complete synthetic export tree and return handles for tampering. */
-export function makeExport(rootDir) {
+export function makeExport(rootDir, options = {}) {
+  // Support both makeExport(dir) and makeExport({ dated: true }).
+  if (rootDir && typeof rootDir === 'object') {
+    options = rootDir;
+    rootDir = undefined;
+  }
+  const timeZone = options.timeZone || 'Asia/Shanghai';
+  const dated = options.dated === true;
   const dir = rootDir || fs.mkdtempSync(path.join(os.tmpdir(), 'dsweb-export-'));
   fs.mkdirSync(dir, { recursive: true });
 
@@ -218,8 +239,59 @@ export function makeExport(rootDir) {
       sender: Number(ACCOUNT_B), senderName: 'Me', created: 1793001000000,
       type: 7, typeName: 'Text', content: { text: 'second conversation' },
       serverId: '7000000000000000008', orderIndex: '1000',
+      time: '2026-10-27 12:00:00', timeZone,
     }),
   ];
+
+  // Opt-in rows spanning several days, a leap day, a year boundary and a second
+  // conversation. Off by default so existing suites keep their exact counts.
+  if (dated) {
+    const day = (time, created, text, uuid, order, sender, senderName) => messageRow({
+      uuid, conversationId: CONVERSATION_A, conversationName: 'Synthetic Chat A',
+      sender: Number(sender), senderName, created,
+      type: 7, typeName: 'Text', content: { text },
+      serverId: `70000000000000001${order}`, orderIndex: `${10000 + order}`,
+      time, timeZone,
+    });
+    accountAMessages.push(
+      day('2024-02-29 08:15:00', 1709194500000, 'leap day morning marker',
+        UUID.datedLeapA, '1', ACCOUNT_A, 'Me'),
+      day('2024-02-29 23:59:59', 1709251199000, 'leap day last second marker',
+        UUID.datedLeapB, '2', PEER_A, 'Peer A'),
+      day('2024-02-28 23:59:59', 1709164799000, 'february twenty eighth marker',
+        UUID.datedFeb28, '3', ACCOUNT_A, 'Me'),
+      day('2024-03-01 00:00:01', 1709251201000, 'march first marker',
+        UUID.datedMar01, '4', PEER_A, 'Peer A'),
+      day('2023-12-31 12:00:00', 1704024000000, 'new year eve marker',
+        UUID.datedDec31, '5', ACCOUNT_A, 'Me'),
+      // No usable `time`: the day must come from created_time in the export
+      // timezone. 2024-02-28T16:30:00Z is 2024-02-29 in Shanghai but still
+      // 2024-02-28 in New York, so the same row proves which zone is used.
+      day('', 1709137800000, 'timezone probe marker',
+        UUID.timezoneProbe, '6', PEER_A, 'Peer A'),
+      // Neither a usable time nor a timestamp: stays queryable without a day.
+      day('', null, 'undated marker', UUID.undated, '7', ACCOUNT_A, 'Me'),
+    );
+    const conversationCMessages = [
+      messageRow({
+        uuid: UUID.conversationC1, conversationId: CONVERSATION_C,
+        conversationName: 'Synthetic Chat C', sender: Number(PEER_C),
+        senderName: 'Peer C', created: 1709360800000,
+        type: 7, typeName: 'Text', content: { text: 'second chat first marker' },
+        serverId: '7000000000000000201', orderIndex: '10100',
+        time: '2024-03-02 10:00:00', timeZone,
+      }),
+      messageRow({
+        uuid: UUID.conversationC2, conversationId: CONVERSATION_C,
+        conversationName: 'Synthetic Chat C', sender: Number(ACCOUNT_A),
+        senderName: 'Me', created: 1709364400000,
+        type: 7, typeName: 'Text', content: { text: 'second chat last marker' },
+        serverId: '7000000000000000202', orderIndex: '10200',
+        time: '2024-03-02 11:00:00', timeZone,
+      }),
+    ];
+    accountAMessages.push(...conversationCMessages);
+  }
 
   for (const item of accountAMessages) {
     if (!['voice', 'sticker', 'unavailable'].includes(item.row.msg_uuid)) continue;
@@ -251,7 +323,7 @@ export function makeExport(rootDir) {
   });
 
   const accountMeta = {
-    [ACCOUNT_A]: { name: 'Synthetic Account A', conversationCount: 1 },
+    [ACCOUNT_A]: { name: 'Synthetic Account A', conversationCount: dated ? 2 : 1 },
     [ACCOUNT_B]: { name: 'Synthetic Account B', conversationCount: 1 },
   };
 
@@ -309,7 +381,7 @@ export function makeExport(rootDir) {
   writeJson(dir, 'export_summary.json', {
     app: 'Duoshan',
     app_version: 'synthetic',
-    timezone: 'Asia/Shanghai',
+    timezone: timeZone,
     total_message_count: accountAMessages.length + accountBMessages.length,
     account_count: accountsSummary.length,
     accounts: accountsSummary,
@@ -332,6 +404,9 @@ export function makeExport(rootDir) {
     accountNames: { [ACCOUNT_A]: 'Synthetic Account A', [ACCOUNT_B]: 'Synthetic Account B' },
     conversationA: CONVERSATION_A,
     conversationB: CONVERSATION_B,
+    conversationC: CONVERSATION_C,
+    dated,
+    timeZone,
     uuids: { ...UUID },
     media: { ...MEDIA },
     mediaHashes: { ...hashes },

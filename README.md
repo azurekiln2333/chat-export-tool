@@ -38,11 +38,31 @@ npm run build
 npm start -- --data "D:\DuoshanChatExport"
 ```
 
-The service imports `reader.sqlite` for querying, search and reversible edits.
+The service imports `reader.sqlite` for querying, search, reversible annotation
+and permanent deletion. It also shows a month calendar of recorded days, computed
+in the export timezone, and filters the paginated list by the selected day.
 Original archives remain available. Media stays in `attachments/` and is served
 through relative URLs, so moving the complete data directory or changing the
-server domain preserves references. See [docs/web-reader.md](docs/web-reader.md)
-for authentication, server deployment and moving an export.
+server domain preserves references.
+
+- **Hide, restore and delete are different.** Hide and restore only change an
+  annotation row. Delete is a real SQL `DELETE` of the message rows, their
+  annotations and the affected conversation aggregates, and it cannot be undone
+  from the UI. There is no recycle bin; only a SHA-256 suppression hash is kept
+  so a reimport does not resurrect the record.
+- **The reader never erases your source archive.** `<uid>/chat.sqlite`,
+  `messages.jsonl`, the CSV/TXT/offline HTML files and `attachments/` are
+  untouched by any reader action. They still contain the deleted messages, so
+  erase them yourself if that is the goal.
+- **`reader.sqlite` is not a backup.** Deleting it loses local edits, notes,
+  hidden flags *and* the deletion suppressions, so deleted messages come back on
+  the next import.
+
+See [docs/web-reader.md](docs/web-reader.md) for the data model, the deletion and
+calendar contract and the full HTTP API. See
+[docs/deployment.md](docs/deployment.md) for the exact local paths, the Linux
+`/opt` + `/srv` layout, `npm ci`/build/start commands, HTTPS reverse-proxy setup
+and backup procedures.
 
 ```powershell
 # 1. Create .venv and install everything (SQLCipher + HEIF + media tools check)
@@ -228,6 +248,11 @@ SQLite or another big-integer-aware JSON reader.
 - **Media completion is honest.** Missing or expired URLs appear with the reason,
   and the reader falls back to the default bubble style when an asset was not
   preserved.
+- **Reader deletion is database-local.** Permanently deleting messages or whole
+  conversations in the web reader changes only `reader.sqlite`. Account
+  `chat.sqlite`, `messages.jsonl`, CSV/TXT/offline HTML and shared media in
+  `attachments/` keep the original rows, and deleting the database restores every
+  deleted message on the next import.
 
 ## Interface language
 

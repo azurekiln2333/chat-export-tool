@@ -2,6 +2,7 @@
 /** Application shell: boot, login gate and the reader layout. */
 import { onMounted, ref, watch } from 'vue';
 
+import ConfirmDialog from './ConfirmDialog.vue';
 import ConversationSidebar from './ConversationSidebar.vue';
 import Icon from './Icon.vue';
 import LoginPanel from './LoginPanel.vue';
@@ -98,5 +99,6 @@ function changeAccount(event) {
     </div>
 
     <ToastStack />
+    <ConfirmDialog />
   </div>
 </template>

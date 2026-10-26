@@ -107,7 +107,7 @@ data survives a console that cannot represent the characters directly.
 
 ## Vue/Node SQLite reader verification
 
-The optional reader was verified on October 27, 2026 with Node.js 24.15.0.
+The initial 0.1.0 reader was verified on October 27, 2026 with Node.js 24.15.0.
 Its runtime uses Vue 3, Node and SQLite without Python. `npm run build`
 succeeded; **66 Node tests passed with 0 failures and 0 skips**.
 
@@ -135,6 +135,55 @@ The real archive was never edited during testing. Only the new `reader.sqlite`
 was created. Verification scripts and detailed real-data reports remain outside
 the repository. Browser automation was stopped by the user; no visual browser
 verification is claimed. The local service was checked through HTTP.
+
+### Reader 0.2.0: deletion, bulk actions and recorded-day calendar
+
+Verified on October 27, 2026 with Node.js 24.15.0. The production Vue build
+succeeded and the final full Node suite passed **140 tests, 0 failures and
+0 skips**. The unchanged exporter also passed its full **108-test** Python
+suite; compile checks and `doctor --json` succeeded.
+
+Independent synthetic SQL/HTTP/client tests cover permanent single/batch
+message and conversation deletion, removal of raw JSON and annotations,
+atomic stale/invalid-batch rejection, hidden-message inclusion, hash-only
+deletion suppression across reopen/changed import/forced reindex, and safe
+failure of the old restore request. Restore uses its own POST route.
+
+Calendar tests cover strict leap-aware dates, export-timezone fallback,
+summary-only timezone changes, index-only persisted timezone, exact daily
+counts, day pagination, and search/conversation/hidden scope. Client tests
+cover cross-page selection, clearing on scope changes, cancelled/failed/retried
+confirmations, page clamping, calendar refresh after annotation changes,
+off-page active-conversation headings and deferred account/query races.
+
+An isolated copy of the pre-upgrade reader database independently verified:
+
+| Check | Observed result |
+| --- | --- |
+| Accounts / conversations / messages preserved | 2 / 75 / 65,724 |
+| Exact raw JSON preserved through index-only migration | All 65,724 rows |
+| Recorded days | 413, from 2025-09-02 through 2026-10-26 |
+| API calendar compared against original SQL date grouping | 21 account-months and 530 account-days, all equal |
+| Bulk deletion confined to the isolated copy | 500 rows removed; SQL absence, integrity and restart checks passed |
+| Original pre-upgrade snapshot | Counts and raw JSON unchanged |
+
+The live service was restarted with the upgraded backend and frontend.
+Read-only verification found the original 65,724 raw JSON rows unchanged,
+75 conversations, zero annotations and zero deletions. Four original account
+SQLite/JSONL files retained their full SHA-256 hashes. Calendar/day queries,
+conversation pagination and delivery of the current Chinese frontend passed
+HTTP checks. No real user record was deleted for testing.
+
+The `duoshan-chat-reader-0.2.0.zip` runtime archive was inspected for English
+member paths and absence of databases, media, personal data, source/tests and
+`node_modules`. After extracting it elsewhere, `npm ci --omit=dev` succeeded.
+Nine production-runtime smoke checks passed: authentication, built Chinese
+frontend/assets, calendar, day pagination, explicit-delete confirmation,
+batch deletion/count refresh, local media ranges and forced-reindex durability.
+This smoke used synthetic data and the packaged server with no Python runtime.
+
+Detailed reports and snapshot copies remain outside the repository. No browser
+or desktop automation was resumed, and no visual verification is claimed.
 
 ## Compatibility limits
 

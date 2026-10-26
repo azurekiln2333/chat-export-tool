@@ -143,4 +143,5 @@ Run `npm ci`, `npm run build` and `npm test` from `web/` for the optional
 database reader. Its independent fixtures test exact large integer imports,
 reversible persistent edits, revision conflicts, media migration/ranges,
 authentication/CSRF/proxy origins, contained paths and bounded shutdown.
-See [web-reader.md](web-reader.md) for the deployment and test contract.
+See [web-reader.md](web-reader.md) for the test contract, data model and HTTP API,
+and [deployment.md](deployment.md) for the deployment paths and procedures.

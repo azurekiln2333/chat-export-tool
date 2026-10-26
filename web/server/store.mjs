@@ -26,6 +26,17 @@
  *   - Reindexing is a single transaction. Annotations live in their own table
  *     and are never deleted, so edits survive a reimport and revision numbers
  *     keep increasing (no ABA).
+ *   - Permanent deletion removes message rows, their annotations and the derived
+ *     aggregates, and records only a SHA-256 key digest in `deletions`. The
+ *     ledger makes the removal durable across reindex, restart and an
+ *     index-only (JSONL pruned) migration without keeping any deleted content
+ *     or name. Freed pages are overwritten on a best-effort basis
+ *     (`secure_delete` + WAL truncation); that is not a forensic guarantee, and
+ *     the exported originals and shared media are never modified.
+ *   - `messages.day` indexes the exporter's local calendar day so day filters
+ *     and the calendar never depend on the viewer's timezone. The export
+ *     timezone is persisted in `store_meta` so a copied database keeps its
+ *     calendar zone even when `export_summary.json` is not alongside it.
  *
  * JSON parsing uses `json-bigint` with `storeAsString`, so integers that a
  * plain `JSON.parse` would round become lossless strings instead.
@@ -41,7 +52,7 @@ import JSONbigFactory from 'json-bigint';
 const JSONbig = JSONbigFactory({ storeAsString: true, useNativeBigInt: false });
 
 /** Bump when the on-disk schema or the import mapping changes. */
-const FORMAT_VERSION = '2';
+const FORMAT_VERSION = '3';
 
 /** Store file name created inside the export root. */
 const DATABASE_FILE = 'reader.sqlite';
@@ -51,9 +62,15 @@ const MESSAGES_FILE = 'messages.jsonl';
 const STATISTICS_FILE = 'statistics.json';
 const CONTACTS_FILE = 'contacts.json';
 
+/** Root file holding the export timezone used for calendar days. */
+const SUMMARY_FILE = 'export_summary.json';
+
 /** Hard bounds for pagination (see web-contract.md). */
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 500;
+
+/** Hard bound for a single permanent-deletion request (design.md). */
+const MAX_BATCH = 500;
 
 /** Upper bound for a single user annotation, to keep the index healthy. */
 const MAX_TEXT_LENGTH = 100_000;
@@ -61,7 +78,11 @@ const MAX_TEXT_LENGTH = 100_000;
 /** An account directory is a plain decimal uid. */
 const UID_PATTERN = /^[0-9]+$/;
 
-const SCHEMA = `
+/**
+ * Tables only. Created before any index so an older database can gain missing
+ * columns (see `#addMissingColumns`) without dropping the rows it already has.
+ */
+const TABLES_SCHEMA = `
 CREATE TABLE IF NOT EXISTS store_meta (
   key   TEXT PRIMARY KEY,
   value TEXT
@@ -92,6 +113,7 @@ CREATE TABLE IF NOT EXISTS messages (
   sender_name       TEXT NOT NULL DEFAULT '',
   created_time      INTEGER,
   time              TEXT NOT NULL DEFAULT '',
+  day               TEXT NOT NULL DEFAULT '',
   message_type      INTEGER,
   type_name         TEXT NOT NULL DEFAULT '',
   text_original     TEXT NOT NULL DEFAULT '',
@@ -112,6 +134,19 @@ CREATE TABLE IF NOT EXISTS message_edits (
   PRIMARY KEY (uid, msg_uuid)
 );
 
+-- Durable record of permanent deletions. Only a domain-separated SHA-256 of
+-- (uid, key) is kept: nothing about the deleted content, its text or the
+-- conversation name can be recovered here. A reimport consults it so removed
+-- rows are never resurrected from the still-untouched source files.
+CREATE TABLE IF NOT EXISTS deletions (
+  kind       TEXT NOT NULL,
+  key_hash   TEXT NOT NULL,
+  deleted_at TEXT NOT NULL,
+  PRIMARY KEY (kind, key_hash)
+);
+`;
+
+const INDEXES_SCHEMA = `
 CREATE INDEX IF NOT EXISTS idx_messages_uid_time
   ON messages (uid, created_time, msg_uuid);
 CREATE INDEX IF NOT EXISTS idx_messages_uid_conversation
@@ -122,9 +157,23 @@ CREATE INDEX IF NOT EXISTS idx_messages_uid_sender
 -- the whole table (each row also carries a large raw_json/meta_json payload).
 CREATE INDEX IF NOT EXISTS idx_messages_search
   ON messages (uid, conversation_id, text_lower, msg_uuid);
+-- Day filter and calendar grouping, per account and per conversation.
+CREATE INDEX IF NOT EXISTS idx_messages_uid_day
+  ON messages (uid, day, created_time, msg_uuid);
+CREATE INDEX IF NOT EXISTS idx_messages_uid_conversation_day
+  ON messages (uid, conversation_id, day, created_time, msg_uuid);
 CREATE INDEX IF NOT EXISTS idx_conversations_uid_last
   ON conversations (uid, last_time);
 `;
+
+/** Columns added after the first release, applied additively on upgrade. */
+const MESSAGE_COLUMN_ADDITIONS = [
+  ['text_lower', "TEXT NOT NULL DEFAULT ''"],
+  ['day', "TEXT NOT NULL DEFAULT ''"],
+];
+const CONVERSATION_COLUMN_ADDITIONS = [
+  ['name_lower', "TEXT NOT NULL DEFAULT ''"],
+];
 
 /**
  * Error type shared with the HTTP layer: `code` is a stable machine string and
@@ -213,6 +262,79 @@ function assertKey(value, label) {
     throw new StoreError('invalid_argument', label + ' contains an invalid character.', 400);
   }
   return text;
+}
+
+/** Days per month (February handled by `isLeapYear`). */
+const MONTH_DAYS = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+function isLeapYear(year) {
+  return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+}
+
+/**
+ * Real calendar-day check (leap years included) without allocating a Date,
+ * used for validation and for the import/backfill pass.
+ */
+function isRealDay(text) {
+  if (typeof text !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(text)) return false;
+  const year = Number(text.slice(0, 4));
+  const month = Number(text.slice(5, 7));
+  const day = Number(text.slice(8, 10));
+  if (month < 1 || month > 12 || day < 1) return false;
+  const limit = month === 2 && isLeapYear(year) ? 29 : MONTH_DAYS[month];
+  return day <= limit;
+}
+
+/** `date` is a strict YYYY-MM-DD real day, or '' meaning "no day filter". */
+function assertDay(value) {
+  const text = asText(value).trim();
+  if (!text) return '';
+  if (!isRealDay(text)) {
+    throw badArgument('date must be a real calendar day in YYYY-MM-DD form.');
+  }
+  return text;
+}
+
+/** `month` must be a strict YYYY-MM value. */
+function assertMonth(value) {
+  const text = asText(value).trim();
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(text)) {
+    throw badArgument('month must be in YYYY-MM form.');
+  }
+  return text;
+}
+
+/** Day part of the exporter's local `time` text, when it is a real date. */
+function dayFromTimeText(value) {
+  const text = asText(value).trim();
+  if (text.length < 10) return '';
+  const candidate = text.slice(0, 10);
+  return isRealDay(candidate) ? candidate : '';
+}
+
+/** True when `zone` is a usable IANA name (or UTC) for Intl formatting. */
+function isUsableZone(zone) {
+  if (!zone) return false;
+  if (zone === 'UTC') return true;
+  try {
+    new Intl.DateTimeFormat('en-CA', { timeZone: zone });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Durable deletion key: a domain-separated SHA-256 of (uid, key). Only this
+ * digest is stored, so the ledger cannot leak a message id or conversation
+ * name, while still refusing to reimport a deleted row.
+ */
+function deletionHash(kind, uid, key) {
+  return createHash('sha256')
+    .update(kind)
+    .update('\u0000')
+    .update(JSON.stringify([uid, key]))
+    .digest('hex');
 }
 
 async function hashFile(file) {
@@ -351,6 +473,10 @@ export class ChatStore {
   #databasePath;
   #db;
   #closed = false;
+  /** Cached export timezone name (IANA) used for calendar days. */
+  #timezoneName;
+  /** Cached formatter for the `created_time` fallback path. */
+  #dayFormatter;
 
   /**
    * @param {string} outputDir export root (contains `<uid>/` directories)
@@ -374,15 +500,34 @@ export class ChatStore {
       fs.mkdirSync(path.dirname(this.#databasePath), { recursive: true });
     }
     this.#db = new DatabaseSync(this.#databasePath);
-    this.#db.exec('PRAGMA busy_timeout = 5000');
-    if (this.#databasePath !== ':memory:') {
+    try {
+      // Best effort: ask SQLite to overwrite freed cell content. This makes a
+      // deleted message harder to recover from the database file, but it is not
+      // a forensic guarantee, and the exported originals are never modified.
       try {
-        this.#db.exec('PRAGMA journal_mode = WAL');
+        this.#db.exec('PRAGMA secure_delete = ON');
       } catch {
-        /* WAL is an optimisation; a read-only location still works. */
+        /* builds without the pragma still delete the rows */
       }
+      this.#db.exec('PRAGMA busy_timeout = 5000');
+      if (this.#databasePath !== ':memory:') {
+        try {
+          this.#db.exec('PRAGMA journal_mode = WAL');
+        } catch {
+          /* WAL is an optimisation; a read-only location still works. */
+        }
+      }
+      this.#migrate();
+    } catch (error) {
+      // A failed migration must not leave a half-open handle or its -wal/-shm
+      // files behind for the next process to trip over.
+      try {
+        this.#db.close();
+      } catch {
+        /* the handle may already be unusable */
+      }
+      throw error;
     }
-    this.#migrate();
   }
 
   /** Absolute export root this store serves. */
@@ -407,17 +552,27 @@ export class ChatStore {
    */
   async initialize(options = {}) {
     this.#assertOpen();
+    // A summary-only timezone change must take effect, so the resolved zone and
+    // its formatter are rebuilt on every initialize.
+    this.#timezoneName = undefined;
+    this.#dayFormatter = undefined;
+
     const force = normalizeFlag(options.force);
     const importable = this.#importableAccounts();
     const counts = this.#counts();
     if (!importable.length) {
       // No JSONL at all: serve the existing index untouched. This is the
       // normal case for a relocated/portable export whose sources were pruned.
+      this.#syncTimezone();
       return { ...counts, imported: false, fingerprint: this.#getMeta('fingerprint') };
     }
     const fingerprint = await this.#fingerprint(importable);
     const stored = this.#getMeta('fingerprint');
-    if (!force && stored && stored === fingerprint && counts.messages > 0) {
+    // The completed-import marker (not the row count) decides whether the index
+    // is current: permanently deleting every message must not look like an
+    // empty database that needs a fresh import on the next restart.
+    if (!force && stored && stored === fingerprint && this.#getMeta('imported_at')) {
+      this.#syncTimezone();
       return { ...counts, imported: false, fingerprint };
     }
     await this.#importAll(importable, fingerprint);
@@ -516,7 +671,7 @@ export class ChatStore {
    *
    * @param {string} uid
    * @param {{conversationId?:string, q?:string, limit?:number, offset?:number,
-   *          includeHidden?:boolean}} [options]
+   *          includeHidden?:boolean, date?:string}} [options]
    * @returns {{items:object[], total:number, limit:number, offset:number}}
    */
   listMessages(uid, options = {}) {
@@ -527,34 +682,84 @@ export class ChatStore {
     const includeHidden = normalizeFlag(options.includeHidden);
     const limit = clampLimit(options.limit);
     const offset = clampOffset(options.offset);
+    const date = assertDay(options.date);
 
-    const params = [account];
-    const where = ['m.uid = ?'];
-    if (conversationId) {
-      where.push('m.conversation_id = ?');
-      params.push(conversationId);
+    const scope = this.#messageScope(account, { conversationId, query, includeHidden });
+    if (date) {
+      scope.where.push('m.day = ?');
+      scope.params.push(date);
     }
-    if (!includeHidden) where.push('COALESCE(e.hidden, 0) = 0');
-    if (query) {
-      where.push(SEARCH_MATCH);
-      params.push(query, query);
-    }
-    const filter = where.join(' AND ');
+    const filter = scope.where.join(' AND ');
 
     const total = this.#guard(() => this.#db.prepare(
       `SELECT COUNT(*) AS total ${MESSAGE_JOIN} WHERE ${filter}`,
-    ).get(...params));
+    ).get(...scope.params));
     const rows = this.#guard(() => this.#db.prepare(`
       SELECT ${MESSAGE_COLUMNS} ${MESSAGE_JOIN}
       WHERE ${filter}
       ORDER BY m.created_time ASC, m.msg_uuid ASC
-      LIMIT ? OFFSET ?`).all(...params, limit, offset));
+      LIMIT ? OFFSET ?`).all(...scope.params, limit, offset));
 
     return {
       items: rows.map(mapMessage),
       total: asInteger(total?.total) ?? 0,
       limit,
       offset,
+    };
+  }
+
+  /**
+   * Recorded days for a month, with counts that honour the same scope as
+   * `listMessages` (account, conversation, search over effective text and
+   * note, and hidden visibility).
+   *
+   * Days are the exporter's local calendar day, so the viewer's timezone never
+   * shifts a message into another day.
+   *
+   * @param {string} uid
+   * @param {{month:string, conversationId?:string, q?:string,
+   *          includeHidden?:boolean}} options
+   * @returns {{month:string, timezone:string,
+   *            days:Array<{date:string, message_count:number}>, total:number,
+   *            first_date:string|null, last_date:string|null}}
+   */
+  getCalendar(uid, options = {}) {
+    this.#assertOpen();
+    const account = assertUid(uid);
+    const month = assertMonth(options.month);
+    const conversationId = asText(options.conversationId).trim();
+    const query = asText(options.q).trim().toLowerCase();
+    const includeHidden = normalizeFlag(options.includeHidden);
+
+    const scope = this.#messageScope(account, { conversationId, query, includeHidden });
+    const filter = scope.where.join(' AND ');
+
+    // Day strings sort lexicographically, so a month is an inclusive range and
+    // never needs a LIKE scan.
+    const rows = this.#guard(() => this.#db.prepare(`
+      SELECT m.day AS day, COUNT(*) AS total ${MESSAGE_JOIN}
+      WHERE ${filter} AND m.day >= ? AND m.day <= ?
+      GROUP BY m.day
+      ORDER BY m.day ASC`).all(...scope.params, month + '-01', month + '-31'));
+
+    const days = rows
+      .filter((row) => row.day && isRealDay(row.day))
+      .map((row) => ({ date: row.day, message_count: asInteger(row.total) ?? 0 }));
+    const total = days.reduce((sum, day) => sum + day.message_count, 0);
+
+    // The overall extent ignores the month filter so the UI can hint at where
+    // recorded data exists, including months it is not currently showing.
+    const bounds = this.#guard(() => this.#db.prepare(`
+      SELECT MIN(m.day) AS first_date, MAX(m.day) AS last_date ${MESSAGE_JOIN}
+      WHERE ${filter} AND m.day <> ''`).get(...scope.params));
+
+    return {
+      month,
+      timezone: this.#timezone(),
+      days,
+      total,
+      first_date: bounds?.first_date ? asText(bounds.first_date) : null,
+      last_date: bounds?.last_date ? asText(bounds.last_date) : null,
     };
   }
 
@@ -619,6 +824,205 @@ export class ChatStore {
     return this.#writeEdit(account, key, change);
   }
 
+  /**
+   * Permanently delete one message and its annotation.
+   *
+   * @param {string} uid
+   * @param {string} msgUuid
+   * @param {number} expectedRevision
+   * @returns {{deleted:true, account_uid:string, deleted_messages:number,
+   *            deleted_conversations:number, msg_uuids:string[], msg_uuid:string}}
+   */
+  deleteMessage(uid, msgUuid, expectedRevision) {
+    const result = this.deleteMessages(uid, [{
+      msg_uuid: msgUuid,
+      expected_revision: expectedRevision,
+    }]);
+    return { ...result, msg_uuid: result.msg_uuids[0] };
+  }
+
+  /**
+   * Permanently delete one conversation, every message it holds (hidden ones
+   * included) and their annotations.
+   *
+   * @param {string} uid
+   * @param {string} conversationId
+   * @param {number} expectedMessageCount
+   * @returns {{deleted:true, account_uid:string, deleted_messages:number,
+   *            deleted_conversations:number, conversation_ids:string[],
+   *            conversation_id:string}}
+   */
+  deleteConversation(uid, conversationId, expectedMessageCount) {
+    const result = this.deleteConversations(uid, [{
+      id: conversationId,
+      expected_message_count: expectedMessageCount,
+    }]);
+    return { ...result, conversation_id: result.conversation_ids[0] };
+  }
+
+  /**
+   * Permanently delete several messages atomically.
+   *
+   * Every entry is validated (existence and revision) inside the write
+   * transaction before anything is removed, so a stale or unknown entry leaves
+   * the database exactly as it was.
+   *
+   * @param {string} uid
+   * @param {Array<{msg_uuid:string, expected_revision:number}>} items
+   * @returns {{deleted:true, account_uid:string, deleted_messages:number,
+   *            deleted_conversations:number, msg_uuids:string[]}}
+   */
+  deleteMessages(uid, items) {
+    this.#assertOpen();
+    const account = assertUid(uid);
+    const requests = this.#readMessageBatch(items);
+
+    let removedConversations = 0;
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      this.#assertAccountExists(account);
+
+      const read = this.#db.prepare(`
+        SELECT m.conversation_id AS conversation_id,
+               COALESCE(e.revision, 0) AS revision
+        ${MESSAGE_JOIN}
+        WHERE m.uid = ? AND m.msg_uuid = ?`);
+      const found = [];
+      for (const request of requests) {
+        const row = read.get(account, request.msg_uuid);
+        if (!row) {
+          throw new StoreError('not_found',
+            'Message not found: ' + request.msg_uuid, 404);
+        }
+        if ((asInteger(row.revision) ?? 0) !== request.expected_revision) {
+          throw new StoreError('conflict',
+            'This message was changed by someone else; reload it and retry.', 409);
+        }
+        found.push({ msg_uuid: request.msg_uuid, conversation_id: row.conversation_id });
+      }
+
+      const removeMessage = this.#db.prepare('DELETE FROM messages WHERE uid = ? AND msg_uuid = ?');
+      const removeEdit = this.#db.prepare('DELETE FROM message_edits WHERE uid = ? AND msg_uuid = ?');
+      const recordDeletion = this.#db.prepare(
+        'INSERT OR REPLACE INTO deletions (kind, key_hash, deleted_at) VALUES (?, ?, ?)');
+      const deletedAt = new Date().toISOString();
+      const conversations = new Set();
+
+      for (const row of found) {
+        removeMessage.run(account, row.msg_uuid);
+        removeEdit.run(account, row.msg_uuid);
+        recordDeletion.run('message', deletionHash('message', account, row.msg_uuid), deletedAt);
+        // Include an empty conversation id too: the import groups messages with
+        // no conversation under '', and its row must be refreshed or removed
+        // like any other.
+        conversations.add(asText(row.conversation_id));
+      }
+      removedConversations = this.#refreshConversations(account, conversations);
+
+      this.#db.exec('COMMIT');
+    } catch (error) {
+      try {
+        this.#db.exec('ROLLBACK');
+      } catch {
+        /* the transaction may already be gone */
+      }
+      throw this.#asStoreError(error);
+    }
+
+    // Runs only after a committed delete, and never throws: a best-effort purge
+    // must not turn a successful deletion into an error response.
+    this.#purgeDeletedBytes();
+
+    return {
+      deleted: true,
+      account_uid: account,
+      deleted_messages: requests.length,
+      deleted_conversations: removedConversations,
+      msg_uuids: requests.map((request) => request.msg_uuid),
+    };
+  }
+
+  /**
+   * Permanently delete several conversations atomically. Hidden messages are
+   * removed as well, because a whole conversation leaves the database.
+   *
+   * @param {string} uid
+   * @param {Array<{id:string, expected_message_count:number}>} items
+   * @returns {{deleted:true, account_uid:string, deleted_messages:number,
+   *            deleted_conversations:number, conversation_ids:string[]}}
+   */
+  deleteConversations(uid, items) {
+    this.#assertOpen();
+    const account = assertUid(uid);
+    const requests = this.#readConversationBatch(items);
+
+    let removedMessages = 0;
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      this.#assertAccountExists(account);
+
+      const read = this.#db.prepare(`
+        SELECT message_count AS message_count FROM conversations
+        WHERE uid = ? AND conversation_id = ?`);
+      const countMessages = this.#db.prepare(
+        'SELECT COUNT(*) AS total FROM messages WHERE uid = ? AND conversation_id = ?');
+      const checked = [];
+      for (const request of requests) {
+        const row = read.get(account, request.id);
+        if (!row) {
+          throw new StoreError('not_found',
+            'Conversation not found: ' + request.id, 404);
+        }
+        if ((asInteger(row.message_count) ?? 0) !== request.expected_message_count) {
+          throw new StoreError('conflict',
+            'This conversation changed since it was loaded; reload it and retry.', 409);
+        }
+        const counted = countMessages.get(account, request.id);
+        checked.push({ id: request.id, messages: asInteger(counted?.total) ?? 0 });
+      }
+
+      const removeEdits = this.#db.prepare(`
+        DELETE FROM message_edits WHERE uid = ? AND msg_uuid IN (
+          SELECT msg_uuid FROM messages WHERE uid = ? AND conversation_id = ?)`);
+      const removeMessages = this.#db.prepare(
+        'DELETE FROM messages WHERE uid = ? AND conversation_id = ?');
+      const removeConversation = this.#db.prepare(
+        'DELETE FROM conversations WHERE uid = ? AND conversation_id = ?');
+      const recordDeletion = this.#db.prepare(
+        'INSERT OR REPLACE INTO deletions (kind, key_hash, deleted_at) VALUES (?, ?, ?)');
+      const deletedAt = new Date().toISOString();
+
+      for (const row of checked) {
+        removeEdits.run(account, account, row.id);
+        removeMessages.run(account, row.id);
+        removeConversation.run(account, row.id);
+        recordDeletion.run('conversation', deletionHash('conversation', account, row.id), deletedAt);
+        removedMessages += row.messages;
+      }
+
+      this.#db.exec('COMMIT');
+    } catch (error) {
+      try {
+        this.#db.exec('ROLLBACK');
+      } catch {
+        /* the transaction may already be gone */
+      }
+      throw this.#asStoreError(error);
+    }
+
+    // Runs only after a committed delete, and never throws: a best-effort purge
+    // must not turn a successful deletion into an error response.
+    this.#purgeDeletedBytes();
+
+    return {
+      deleted: true,
+      account_uid: account,
+      deleted_messages: removedMessages,
+      deleted_conversations: requests.length,
+      conversation_ids: requests.map((request) => request.id),
+    };
+  }
+
   /** Close the underlying database handle. Safe to call twice. */
   close() {
     if (this.#closed) return;
@@ -631,23 +1035,95 @@ export class ChatStore {
   }
 
   /**
-   * Create the schema, replacing index tables written by an older format.
-   * Annotations (`message_edits`) are never dropped, so a format bump keeps
-   * the user's edits; the next `initialize()` simply reimports the sources.
+   * Create or upgrade the schema *additively and atomically*.
+   *
+   * Older reader databases gain the new columns, tables and indexes in place:
+   * no index table is ever dropped, so an index-only export (its JSONL pruned)
+   * keeps every record through the upgrade. The whole upgrade, including the
+   * column backfill and the version/timezone markers, shares one transaction,
+   * so a failure can never leave a `day` column present but unfilled: the added
+   * column is rolled back with everything else and the next run retries.
    */
   #migrate() {
-    // Only store_meta may be touched before the format is known: creating the
-    // indexes below against an older messages table would fail.
-    this.#db.exec('CREATE TABLE IF NOT EXISTS store_meta (key TEXT PRIMARY KEY, value TEXT)');
-    const stored = this.#getMeta('format_version');
-    if (stored && stored !== FORMAT_VERSION) {
-      this.#db.exec('DROP TABLE IF EXISTS messages');
-      this.#db.exec('DROP TABLE IF EXISTS conversations');
-      this.#db.exec('DROP TABLE IF EXISTS accounts');
-      this.#db.exec("DELETE FROM store_meta WHERE key IN ('fingerprint', 'imported_at')");
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      this.#db.exec(TABLES_SCHEMA);
+      const added = [
+        ...this.#addMissingColumns('messages', MESSAGE_COLUMN_ADDITIONS),
+        ...this.#addMissingColumns('conversations', CONVERSATION_COLUMN_ADDITIONS),
+      ];
+      this.#db.exec(INDEXES_SCHEMA);
+      this.#backfill(added);
+      // Record a zone only when none is stored yet. Overwriting it here would
+      // hide a summary-only timezone edit from initialize(), which is what
+      // reconciles the zone-dependent days.
+      if (!this.#getMeta('timezone')) this.#setMeta('timezone', this.#timezone());
+      this.#setMeta('format_version', FORMAT_VERSION);
+      this.#db.exec('COMMIT');
+    } catch (error) {
+      try {
+        this.#db.exec('ROLLBACK');
+      } catch {
+        /* the transaction may already be gone */
+      }
+      throw this.#asStoreError(error);
     }
-    this.#db.exec(SCHEMA);
-    this.#setMeta('format_version', FORMAT_VERSION);
+  }
+
+  /**
+   * Add columns a database predates. Table and column identifiers come from the
+   * module's own constants, never from request data. Runs inside the migration
+   * transaction.
+   */
+  #addMissingColumns(table, additions) {
+    const existing = new Set(
+      this.#db.prepare(`PRAGMA table_info(${table})`).all().map((row) => row.name));
+    const added = [];
+    for (const [column, definition] of additions) {
+      if (existing.has(column)) continue;
+      this.#db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+      added.push(column);
+    }
+    return added;
+  }
+
+  /**
+   * Fill columns that this run just added, so older rows stay queryable. Called
+   * inside the migration transaction, which is what makes the upgrade atomic.
+   */
+  #backfill(added) {
+    if (!added.length) return;
+    if (added.includes('text_lower')) this.#backfillTextLower();
+    if (added.includes('name_lower')) this.#backfillNameLower();
+    if (added.includes('day')) this.#backfillDays();
+  }
+
+  #backfillTextLower() {
+    const rows = this.#db.prepare('SELECT uid, msg_uuid, text_original FROM messages').all();
+    const update = this.#db.prepare(
+      'UPDATE messages SET text_lower = ? WHERE uid = ? AND msg_uuid = ?');
+    for (const row of rows) {
+      update.run(asText(row.text_original).toLowerCase(), row.uid, row.msg_uuid);
+    }
+  }
+
+  #backfillNameLower() {
+    const rows = this.#db.prepare('SELECT uid, conversation_id, name FROM conversations').all();
+    const update = this.#db.prepare(
+      'UPDATE conversations SET name_lower = ? WHERE uid = ? AND conversation_id = ?');
+    for (const row of rows) {
+      update.run(asText(row.name).toLowerCase(), row.uid, row.conversation_id);
+    }
+  }
+
+  /** Compute `day` for every existing row, including an index-only database. */
+  #backfillDays() {
+    const rows = this.#db.prepare('SELECT uid, msg_uuid, time, created_time FROM messages').all();
+    const update = this.#db.prepare(
+      'UPDATE messages SET day = ? WHERE uid = ? AND msg_uuid = ?');
+    for (const row of rows) {
+      update.run(this.#dayValue(row.time, row.created_time), row.uid, row.msg_uuid);
+    }
   }
 
   // ---------------------------------------------------------------- internals
@@ -659,13 +1135,17 @@ export class ChatStore {
   }
 
   /** Convert unexpected driver failures into StoreError without leaking SQL. */
+  #asStoreError(error) {
+    if (error instanceof StoreError) return error;
+    return new StoreError('database_error', 'The reader index could not be read.',
+      500, { cause: error });
+  }
+
   #guard(operation) {
     try {
       return operation();
     } catch (error) {
-      if (error instanceof StoreError) throw error;
-      throw new StoreError('database_error', 'The reader index could not be read.',
-        500, { cause: error });
+      throw this.#asStoreError(error);
     }
   }
 
@@ -697,6 +1177,275 @@ export class ChatStore {
     };
   }
 
+  /**
+   * Export timezone used for calendar days.
+   *
+   * Precedence: the root summary (authoritative and part of the fingerprint),
+   * then the zone persisted by an earlier import, then the `timezone` field the
+   * exporter stored in each row's `_export` metadata (this is what lets a
+   * version-2 database whose JSONL and summary are both gone keep its calendar
+   * zone), and only then UTC.
+   */
+  #timezone() {
+    if (this.#timezoneName !== undefined) return this.#timezoneName;
+    let zone = this.#summaryTimezone()
+      || this.#storedTimezone()
+      || this.#metadataTimezone()
+      || 'UTC';
+    this.#timezoneName = zone;
+    return zone;
+  }
+
+  /** Timezone recorded in `export_summary.json`, when usable. */
+  #summaryTimezone() {
+    try {
+      const summary = JSON.parse(
+        fs.readFileSync(path.join(this.#outputDir, SUMMARY_FILE), 'utf8'));
+      const zone = summary && typeof summary === 'object'
+        ? asText(summary.timezone).trim() : '';
+      return isUsableZone(zone) ? zone : '';
+    } catch {
+      return '';
+    }
+  }
+
+  /** Timezone persisted in `store_meta` by an earlier import or migration. */
+  #storedTimezone() {
+    const zone = this.#getMeta('timezone');
+    return zone && isUsableZone(zone) ? zone : '';
+  }
+
+  /** Timezone carried by the exported `_export` block of a stored row. */
+  #metadataTimezone() {
+    let row;
+    try {
+      row = this.#db.prepare(
+        `SELECT meta_json FROM messages WHERE instr(meta_json, '"timezone"') > 0 LIMIT 1`,
+      ).get();
+    } catch {
+      return '';
+    }
+    if (!row || !row.meta_json) return '';
+    const meta = parseJsonLossless(row.meta_json);
+    const zone = meta && typeof meta === 'object' ? asText(meta.timezone).trim() : '';
+    return isUsableZone(zone) ? zone : '';
+  }
+
+  /**
+   * Keep the persisted zone and the zone-dependent days in step with the export.
+   *
+   * Only rows whose exported `time` text does not carry a real day depend on the
+   * zone; the rest are skipped even though they are read. A change therefore
+   * costs one pass, and only when `export_summary.json` was edited.
+   */
+  #syncTimezone() {
+    const zone = this.#timezone();
+    if (this.#getMeta('timezone') === zone) return;
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      this.#setMeta('timezone', zone);
+      this.#refreshZoneDependentDays();
+      this.#db.exec('COMMIT');
+    } catch (error) {
+      try {
+        this.#db.exec('ROLLBACK');
+      } catch {
+        /* the transaction may already be gone */
+      }
+      throw this.#asStoreError(error);
+    }
+  }
+
+  /** Recompute `day` for rows that had to fall back to `created_time`. */
+  #refreshZoneDependentDays() {
+    const rows = this.#db.prepare(
+      'SELECT uid, msg_uuid, time, created_time, day FROM messages').all();
+    const update = this.#db.prepare(
+      'UPDATE messages SET day = ? WHERE uid = ? AND msg_uuid = ?');
+    for (const row of rows) {
+      if (dayFromTimeText(row.time)) continue; // the exported day decides
+      const day = this.#formatDay(row.created_time);
+      if (day !== asText(row.day)) update.run(day, row.uid, row.msg_uuid);
+    }
+  }
+
+  /** Lazily created formatter for the `created_time` fallback path. */
+  #formatter() {
+    if (this.#dayFormatter === undefined) {
+      this.#dayFormatter = new Intl.DateTimeFormat('en-CA', {
+        timeZone: this.#timezone(),
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+      });
+    }
+    return this.#dayFormatter;
+  }
+
+  /**
+   * Calendar day for one row: the exporter's own local `time` when it is a real
+   * date, otherwise `created_time` rendered in the export timezone. Never the
+   * server's or the browser's local timezone.
+   */
+  #dayValue(time, createdTime) {
+    const fromTime = dayFromTimeText(time);
+    if (fromTime) return fromTime;
+    return this.#formatDay(createdTime);
+  }
+
+  #formatDay(createdTime) {
+    const milliseconds = asInteger(createdTime);
+    if (milliseconds === null) return '';
+    let parts;
+    try {
+      parts = this.#formatter().formatToParts(new Date(milliseconds));
+    } catch {
+      return '';
+    }
+    const pick = (type) => parts.find((part) => part.type === type)?.value ?? '';
+    const text = `${pick('year')}-${pick('month')}-${pick('day')}`;
+    return isRealDay(text) ? text : '';
+  }
+
+  /**
+   * Shared WHERE clause for message queries: account, optional conversation,
+   * search over effective text and note, and hidden visibility.
+   */
+  #messageScope(account, { conversationId = '', query = '', includeHidden = false }) {
+    const params = [account];
+    const where = ['m.uid = ?'];
+    if (conversationId) {
+      where.push('m.conversation_id = ?');
+      params.push(conversationId);
+    }
+    if (!includeHidden) where.push('COALESCE(e.hidden, 0) = 0');
+    if (query) {
+      where.push(SEARCH_MATCH);
+      params.push(query, query);
+    }
+    return { where, params };
+  }
+
+  /**
+   * Recompute count/first/last for the conversations touched by a deletion and
+   * drop the ones that no longer hold any message. Returns how many were
+   * removed.
+   */
+  #refreshConversations(account, conversationIds) {
+    const aggregate = this.#db.prepare(`
+      SELECT COUNT(*) AS total, MIN(created_time) AS first_time,
+             MAX(created_time) AS last_time
+      FROM messages WHERE uid = ? AND conversation_id = ?`);
+    const update = this.#db.prepare(`
+      UPDATE conversations SET message_count = ?, first_time = ?, last_time = ?
+      WHERE uid = ? AND conversation_id = ?`);
+    const remove = this.#db.prepare(
+      'DELETE FROM conversations WHERE uid = ? AND conversation_id = ?');
+    let removed = 0;
+    for (const id of conversationIds) {
+      const row = aggregate.get(account, id);
+      const total = asInteger(row?.total) ?? 0;
+      if (total === 0) {
+        remove.run(account, id);
+        removed += 1;
+      } else {
+        update.run(total, asInteger(row.first_time), asInteger(row.last_time), account, id);
+      }
+    }
+    return removed;
+  }
+
+  /**
+   * Drop the write-ahead log after a permanent deletion.
+   *
+   * Best effort: `secure_delete` overwrites the freed cells inside the database
+   * pages, but the WAL still holds the pre-delete frames until it is
+   * checkpointed. Truncating it here removes that copy for the common case. It
+   * is not a guarantee, and it is deliberately infallible: the delete is already
+   * committed, so a purge problem must never surface as a failed deletion. The
+   * next checkpoint (or a clean close) truncates the log anyway.
+   */
+  #purgeDeletedBytes() {
+    if (this.#databasePath === ':memory:') return;
+    try {
+      this.#db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    } catch {
+      /* another reader may hold the log open; the next checkpoint retries */
+    }
+  }
+
+  /** An account is known once it has been imported; deletions of it are 404. */
+  #assertAccountExists(account) {
+    const row = this.#db.prepare('SELECT 1 AS ok FROM accounts WHERE uid = ? LIMIT 1')
+      .get(account);
+    if (!row) throw new StoreError('not_found', 'Account not found.', 404);
+  }
+
+  /** Validate a message deletion batch before any database work. */
+  #readMessageBatch(items) {
+    if (!Array.isArray(items) || items.length === 0) {
+      throw badArgument('Select at least one message.');
+    }
+    if (items.length > MAX_BATCH) {
+      throw new StoreError('invalid_batch',
+        `At most ${MAX_BATCH} messages can be deleted at once.`, 400);
+    }
+    const seen = new Set();
+    const requests = [];
+    for (const item of items) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        throw badArgument('Each message entry must be an object.');
+      }
+      const key = assertKey(item.msg_uuid, 'msg_uuid');
+      const revision = item.expected_revision;
+      if (typeof revision !== 'number' || !Number.isInteger(revision) || revision < 0) {
+        throw badArgument('expected_revision must be a non-negative integer.');
+      }
+      if (seen.has(key)) throw badArgument('Duplicate msg_uuid in the request.');
+      seen.add(key);
+      requests.push({ msg_uuid: key, expected_revision: revision });
+    }
+    return requests;
+  }
+
+  /** Validate a conversation deletion batch before any database work. */
+  #readConversationBatch(items) {
+    if (!Array.isArray(items) || items.length === 0) {
+      throw badArgument('Select at least one conversation.');
+    }
+    if (items.length > MAX_BATCH) {
+      throw new StoreError('invalid_batch',
+        `At most ${MAX_BATCH} conversations can be deleted at once.`, 400);
+    }
+    const seen = new Set();
+    const requests = [];
+    for (const item of items) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        throw badArgument('Each conversation entry must be an object.');
+      }
+      const key = assertKey(item.id, 'conversation id');
+      const count = item.expected_message_count;
+      if (typeof count !== 'number' || !Number.isInteger(count) || count < 1) {
+        throw badArgument('expected_message_count must be a positive integer.');
+      }
+      if (seen.has(key)) throw badArgument('Duplicate conversation id in the request.');
+      seen.add(key);
+      requests.push({ id: key, expected_message_count: count });
+    }
+    return requests;
+  }
+
+  /** Load the durable deletion ledger as digests grouped by kind. */
+  #loadDeletionHashes() {
+    const message = new Set();
+    const conversation = new Set();
+    for (const row of this.#db.prepare('SELECT kind, key_hash FROM deletions').all()) {
+      if (row.kind === 'message') message.add(row.key_hash);
+      else if (row.kind === 'conversation') conversation.add(row.key_hash);
+    }
+    return { message, conversation };
+  }
+
   /** Account directories: `<output>/<decimal uid>/`. */
   #accountDirs() {
     return fs.readdirSync(this.#outputDir, { withFileTypes: true })
@@ -717,7 +1466,14 @@ export class ChatStore {
     });
   }
 
-  /** Importable files, relative to the export root, in a stable order. */
+  /**
+   * Importable files, relative to the export root, in a stable order.
+   *
+   * The root summary is included because it carries the export timezone that
+   * decides how a `created_time`-only row is assigned to a calendar day: a
+   * timezone-only edit must invalidate the import instead of leaving stale days
+   * behind.
+   */
   #sourceFiles(accounts) {
     const files = [];
     for (const uid of accounts) {
@@ -727,6 +1483,10 @@ export class ChatStore {
           files.push(path.join(uid, name).replace(/\\/g, '/'));
         }
       }
+    }
+    const summary = path.join(this.#outputDir, SUMMARY_FILE);
+    if (fs.existsSync(summary) && fs.statSync(summary).isFile()) {
+      files.push(SUMMARY_FILE);
     }
     return files;
   }
@@ -754,9 +1514,9 @@ export class ChatStore {
     const insertMessage = this.#db.prepare(`
       INSERT OR REPLACE INTO messages (
         uid, msg_uuid, conversation_id, conversation_name, sender, sender_name,
-        created_time, time, message_type, type_name, text_original, text_lower,
-        raw_json, meta_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+        created_time, time, day, message_type, type_name, text_original,
+        text_lower, raw_json, meta_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     const insertAccount = this.#db.prepare(
       'INSERT OR REPLACE INTO accounts (uid, name) VALUES (?, ?)');
     const clearMessages = this.#db.prepare('DELETE FROM messages WHERE uid = ?');
@@ -791,6 +1551,11 @@ export class ChatStore {
     const readConversationNames = this.#db.prepare(
       'SELECT conversation_id, name FROM conversations WHERE uid = ?');
 
+    // Permanently deleted rows must never come back from an unchanged source,
+    // so the ledger is consulted while importing. Hashing is skipped entirely
+    // when a kind has no recorded deletions.
+    const deleted = this.#loadDeletionHashes();
+
     this.#db.exec('BEGIN IMMEDIATE');
     try {
       for (const uid of accounts) {
@@ -809,6 +1574,12 @@ export class ChatStore {
         for await (const line of readJsonLines(messagesPath)) {
           const row = normalizeRow(line);
           if (!row.msg_uuid) continue;
+          if (deleted.message.size
+            && deleted.message.has(deletionHash('message', uid, row.msg_uuid))) continue;
+          if (deleted.conversation.size && row.conversation_id
+            && deleted.conversation.has(deletionHash('conversation', uid, row.conversation_id))) {
+            continue;
+          }
           insertMessage.run(
             uid,
             row.msg_uuid,
@@ -818,6 +1589,7 @@ export class ChatStore {
             row.sender_name,
             row.created_time,
             row.time,
+            this.#dayValue(row.time, row.created_time),
             row.message_type,
             row.type_name,
             row.text_original,
@@ -843,6 +1615,7 @@ export class ChatStore {
       }
 
       this.#setMeta('fingerprint', fingerprint);
+      this.#setMeta('timezone', this.#timezone());
       this.#setMeta('imported_at', new Date().toISOString());
       this.#setMeta('output_dir', this.#outputDir);
       this.#db.exec('COMMIT');

@@ -43,3 +43,29 @@ messages to satisfy language tests.
   error codes. Ignore stale account/search responses after a newer request.
 - Run `npm run build` and `npm test`. Do not describe compilation or HTTP
   probes as visual browser verification.
+
+## Bulk actions and date browsing
+
+- Paginate conversations and messages independently. Current-page select-all
+  may retain selections across pages of the same query; clear selection when
+  account, conversation, search, selected date or hidden scope changes.
+- Store selected message revisions and conversation counts. Send batches of
+  at most 500 with `confirm_delete:true`; never replace revision conflicts
+  with guessed values or silently split an atomic request.
+- Show Chinese permanent-delete confirmation with selected item count,
+  `reader.sqlite` boundary and irreversible nature. Preserve selection on
+  failure; offer cancellation/retry and disable double submission.
+- Keep restore on `POST api/message/restore`. A permanent delete must never
+  reuse the restore action. Refresh account/conversation/message/calendar
+  counts after deletion and clamp an emptied page to the last valid page.
+- Render calendar month/day/counts from `api/calendar`, display export
+  timezone, filter messages with `date=YYYY-MM-DD`, and offer clear-date.
+  Do not bucket timestamps using the browser's local timezone.
+- Edits to effective text/notes under search and hide/restore can change
+  result membership. Refetch both page and calendar when this happens.
+- Capture account/query scope before awaits. Ignore stale annotation/error
+  replies and cancel pending destructive confirmations/retries after scope
+  switches. An old account's request cannot modify a new account's state.
+- Verify through deferred-request client tests, independent SQL/HTTP tests,
+  production build and Chinese/relative-asset checks. Keep private real data
+  out of fixtures and never test deletion on the live reader database.

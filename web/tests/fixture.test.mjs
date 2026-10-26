@@ -21,7 +21,7 @@ test('fixture contains only constructed placeholder identifiers', () => {
     assert.match(uid, /^(81|82)\d{14}$/);
   }
   for (const uuid of Object.values(UUID)) {
-    assert.match(uuid, /^([ab])\1{7}-0000-4000-8000-\d{12}$/);
+    assert.match(uuid, /^([abc])\1{7}-0000-4000-8000-\d{12}$/);
   }
 });
 

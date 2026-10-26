@@ -18,6 +18,9 @@ const ERROR_MESSAGES = {
   origin_rejected: '页面地址与服务地址不一致，请检查代理配置。',
   host_rejected: '当前访问地址未获允许。',
   conflict: '该消息已被更新，请确认最新内容后重新保存。',
+  confirmation_required: '永久删除需要明确确认，请重新确认后再试。',
+  limit_exceeded: '一次可处理的条目过多，请减少选择后重试。',
+  invalid_batch: '一次删除的条目过多（服务端最多 500 项），请减少选择后重试。',
   not_found: '未找到请求的记录或文件。',
   invalid_argument: '输入内容不符合要求，请检查后重试。',
   invalid_account: '账号标识无效。',
@@ -108,3 +111,9 @@ export const api = {
   patch: (path, body, params) => request('PATCH', path, { body, params }),
   delete: (path, body, params) => request('DELETE', path, { body, params }),
 };
+
+/** Display text for any thrown error, preferring the Chinese code mapping. */
+export function describeError(error, fallback = '操作失败，请稍后重试。') {
+  if (error instanceof ApiError) return error.message;
+  return fallback;
+}
