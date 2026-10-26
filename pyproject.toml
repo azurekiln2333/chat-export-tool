@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "duoshan-chat-export-tool"
+version = "0.1.0"
+description = "Export local Android Duoshan backups to SQLite, JSONL, CSV and an offline HTML reader"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "Pillow>=10.0",
+  "requests>=2.31",
+  "zstandard>=0.22",
+  "tzdata>=2024.1",
+]
+
+[project.optional-dependencies]
+encrypted = ["sqlcipher3-wheels>=0.5.7"]
+heif = ["pillow-heif>=0.18"]
+full = ["sqlcipher3-wheels>=0.5.7", "pillow-heif>=0.18"]
+
+[project.scripts]
+duoshan-export = "duoshan_export.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
