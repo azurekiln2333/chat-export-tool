@@ -23,6 +23,7 @@ class ExportConfig:
     ffmpeg: str = "ffmpeg"
     ffprobe: str = "ffprobe"
     resume: bool = False
+    app: str = "auto"
 
     def __post_init__(self) -> None:
         for name in ("source", "output", "work"):
@@ -30,7 +31,13 @@ class ExportConfig:
         if self.sqlcipher_module_path is not None:
             object.__setattr__(self, "sqlcipher_module_path", Path(self.sqlcipher_module_path).expanduser().resolve())
         object.__setattr__(self, "accounts", tuple(dict.fromkeys(str(uid) for uid in self.accounts)))
-        if any(not uid.isascii() or not uid.isdecimal() for uid in self.accounts):
+        if self.app == "xhs":
+            # Xiaohongshu account ids are lowercase hex (e.g. 68cf0e5d...).
+            if any(not uid.isascii() or uid.lower() != uid
+                   or any(ch not in "0123456789abcdef" for ch in uid)
+                   for uid in self.accounts):
+                raise ExportError("Xiaohongshu account IDs must be lowercase hex strings.")
+        elif any(not uid.isascii() or not uid.isdecimal() for uid in self.accounts):
             raise ExportError("Account IDs must contain ASCII digits only.")
         if not 1 <= self.page_size <= 5000:
             raise ExportError("Page size must be between 1 and 5000 messages.")

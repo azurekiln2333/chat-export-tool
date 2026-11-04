@@ -5,6 +5,14 @@ fully offline archive: a standalone SQLite database, raw JSONL, spreadsheet-safe
 CSV, per-conversation text files and a browsable HTML reader with the original
 voice messages, stickers, inline emoji and chat-bubble artwork.
 
+**Xiaohongshu (`com.xingin.xhs`) backups are supported too**: the same
+`inspect`/`export` commands decrypt its WCDB-encrypted `msgDB`/`localRelationDB`
+(using the passphrases stored in the backup's MMKV files) and produce the same
+portable reader tree. See [docs/xhs-export.md](docs/xhs-export.md). With the
+default `--app auto` policy Duoshan behaviour is unchanged; Xiaohongshu
+decryption additionally needs `pip install "duoshan-chat-export-tool[xhs]"`
+(the `cryptography` package).
+
 The tool only **reads** the backup you give it. It never logs in, never contacts
 the network unless you explicitly ask it to, and never modifies the original
 files. The original message content is preserved byte for byte.

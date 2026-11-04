@@ -4,6 +4,12 @@
 档案：独立的 SQLite 数据库、原始 JSONL、防表格公式注入的 CSV、按会话拆分的文本，
 以及可以直接用浏览器打开的离线阅读页面，并尽量还原语音、表情、文字小表情和聊天气泡。
 
+**同样支持小红书（`com.xingin.xhs`）备份**：沿用相同的 `inspect`/`export` 命令，
+自动解密其 WCDB 加密的 `msgDB`/`localRelationDB`（口令取自备份内的 MMKV 文件），
+输出同构的离线阅读目录。默认 `--app auto` 策略下多闪行为完全不变；小红书解密
+需要额外安装 `cryptography`（`pip install "duoshan-chat-export-tool[xhs]"`）。
+详见 [docs/xhs-export.md](docs/xhs-export.md)。
+
 工具只**读取**你提供的备份，不会登录、不会修改原始文件，也**默认不联网**。
 英文说明见 [README.md](README.md)。
 

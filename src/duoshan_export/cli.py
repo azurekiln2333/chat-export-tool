@@ -33,6 +33,12 @@ def _json_flag(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true", help="Write the result as JSON; send progress to stderr")
 
 
+def _app_flag(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--app", choices=["auto", "duoshan", "xhs"], default="auto",
+                        help="App rules to apply (default: auto-detect; 'auto' keeps Duoshan "
+                             "behaviour for Duoshan backups and switches only for Xiaohongshu data)")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="duoshan-export", description="Export local Android Duoshan backups to SQLite and an offline chat reader.")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -41,6 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("source", type=_path)
     inspect.add_argument("--work-dir", type=_path, help="Extraction/snapshot directory (default: a temporary directory)")
     inspect.add_argument("--sqlcipher-module-path", type=_path)
+    _app_flag(inspect)
     _json_flag(inspect)
 
     export = commands.add_parser("export", help="Create a portable export; networking is opt-in")
@@ -54,6 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("--reuse-media", type=_path, metavar="EXPORT", help="Copy verified matching media from an existing export")
     export.add_argument("--decode-media", action="store_true", help="Also decode media during final validation")
     _common_runtime(export)
+    _app_flag(export)
     _json_flag(export)
 
     media = commands.add_parser("media", help="Reuse/download media, rebuild the reader and refresh the SQLite media index")
@@ -98,6 +106,7 @@ def _config(args, *, source: Path | None = None, state: dict | None = None) -> E
         ffmpeg=args.ffmpeg,
         ffprobe=args.ffprobe,
         resume=getattr(args, "resume", True),
+        app=getattr(args, "app", state.get("app", "auto")),
     )
 
 
@@ -109,6 +118,7 @@ def _check_validation(report: dict) -> None:
 
 def _export(args) -> dict:
     from .source import prepare_source
+    from .apps import resolve_app
     from .exporter import export_chats, rerender_export
     from .media import download_media, prepare_decorations
     from .media_index import index_media
@@ -118,6 +128,9 @@ def _export(args) -> dict:
     state = begin_export(config)
     print("Preparing source backup...", flush=True)
     layout = prepare_source(config.source, config.work)
+    app = resolve_app(config.app, layout)
+    if app == "xhs":
+        return _export_with_app(args, config, state, layout, app)
     print("Exporting chat records...", flush=True)
     summary = export_chats(config, layout)
     reused = None
@@ -136,6 +149,29 @@ def _export(args) -> dict:
     write_json(config.output / STATE_FILE, state)
     return {"status": "completed", "output": str(config.output), "reader": str(config.output / "index.html"),
             "summary": summary, "media_reuse": reused, "media_index": index, "validation": report}
+
+
+def _export_with_app(args, config, state, layout, app: str) -> dict:
+    """Export pipeline for non-Duoshan app rules (currently Xiaohongshu).
+
+    The Duoshan-only media, decoration and web-reader stages do not apply to
+    these exports; the app adapter writes its own summary and validation
+    report instead.
+    """
+    del args
+    from .apps.xhs_export import export_chats as export_xhs_chats
+
+    print("Exporting Xiaohongshu chat records...", flush=True)
+    summary = export_xhs_chats(config, layout)
+    state.update(status="completed", timezone=config.timezone,
+                 page_size=config.page_size, app=app)
+    write_json(config.output / STATE_FILE, state)
+    return {"status": "completed", "output": str(config.output),
+            "reader": str(config.output / "index.html"),
+            "summary": summary, "media_reuse": None, "media_index": None,
+            "validation": json.loads(
+                (config.output / "validation_results.json").read_text(encoding="utf-8")),
+            "app": app, "mode": "export"}
 
 
 def _media(args) -> dict:
@@ -171,10 +207,14 @@ def _media(args) -> dict:
 
 def _inspect(args) -> dict:
     from .source import prepare_source, discover_accounts
+    from .apps import resolve_app
     from .database import open_database
 
     def inspect_at(work):
         layout = prepare_source(args.source, work)
+        app = resolve_app(getattr(args, "app", "auto"), layout)
+        if app == "xhs":
+            return _inspect_xhs(layout, args)
         results = []
         for account in discover_accounts(layout):
             row = {"uid": account.uid, "database": str(account.database), "contacts_available": bool(account.contacts_database)}
@@ -185,7 +225,7 @@ def _inspect(args) -> dict:
             except ExportError as error:
                 row["inspection_error"] = str(error)
             results.append(row)
-        return {"source": str(args.source), "app_directory": str(layout.app_dir), "accounts": results,
+        return {"source": str(args.source), "app_directory": str(layout.app_dir), "app": app, "accounts": results,
                 "note": "Archive inspection paths are temporary unless --work-dir was supplied."}
     if args.work_dir:
         # Prevent an inspection from unpacking into the source itself.
@@ -195,6 +235,48 @@ def _inspect(args) -> dict:
         return inspect_at(args.work_dir)
     with tempfile.TemporaryDirectory(prefix="duoshan-inspect-") as directory:
         return inspect_at(Path(directory))
+
+
+def _inspect_xhs(layout, args) -> dict:
+    """Inspect a Xiaohongshu backup: accounts, databases and message counts."""
+    import sqlite3
+
+    from .apps import xhs as xhs_app
+
+    source = xhs_app.discover(layout)
+    if source is None:  # pragma: no cover - resolve_app guarantees this
+        raise ExportError("No Xiaohongshu app data found in this backup.")
+    work = Path(layout.work_dir) / "xhs"
+    work.mkdir(parents=True, exist_ok=True)
+    results = []
+    decrypted = {}
+    for spec in xhs_app.SUPPORTED_DATABASES:
+        if spec.name not in source.databases:
+            continue
+        try:
+            info = xhs_app.decrypt_database(
+                source, spec, work / (spec.name + ".plain.sqlite"))
+            decrypted[spec.name] = info["output"]
+        except ExportError as error:
+            results.append({"database": spec.name, "inspection_error": str(error)})
+    if xhs_app.MESSAGE_DB.name in decrypted:
+        db = sqlite3.connect(decrypted[xhs_app.MESSAGE_DB.name])
+        try:
+            for uid in xhs_app.account_ids(db):
+                count = db.execute(
+                    "SELECT count(*) FROM message WHERE (CASE WHEN local_chat_user_id LIKE '%@%'"
+                    " THEN substr(local_chat_user_id, instr(local_chat_user_id, '@') + 1)"
+                    " WHEN local_group_chat_id LIKE '%@%'"
+                    " THEN substr(local_group_chat_id, instr(local_group_chat_id, '@') + 1)"
+                    " ELSE '' END) = ?", (uid,)).fetchone()[0]
+                results.append({"uid": uid, "database": "msgDB", "message_count": count})
+        finally:
+            db.close()
+    return {"source": str(args.source), "app_directory": str(source.app_dir), "app": "xhs",
+            "databases": sorted(source.databases),
+            "login_user_id": xhs_app.login_user_id(source) or "",
+            "accounts": results,
+            "note": "Archive inspection paths are temporary unless --work-dir was supplied."}
 
 
 def _doctor(args) -> dict:

@@ -18,7 +18,8 @@ dependencies = [
 [project.optional-dependencies]
 encrypted = ["sqlcipher3-wheels>=0.5.7"]
 heif = ["pillow-heif>=0.18"]
-full = ["sqlcipher3-wheels>=0.5.7", "pillow-heif>=0.18"]
+xhs = ["cryptography>=42.0"]
+full = ["sqlcipher3-wheels>=0.5.7", "pillow-heif>=0.18", "cryptography>=42.0"]
 
 [project.scripts]
 duoshan-export = "duoshan_export.cli:main"
