@@ -75,8 +75,11 @@ const MAX_BATCH = 500;
 /** Upper bound for a single user annotation, to keep the index healthy. */
 const MAX_TEXT_LENGTH = 100_000;
 
-/** An account directory is a plain decimal uid. */
+/** An account directory is a plain decimal uid (Duoshan) or a lowercase hex
+ * uid (Xiaohongshu, e.g. 68cf0e5d000000002102b928). Both are safe path
+ * components; anything else is rejected. */
 const UID_PATTERN = /^[0-9]+$/;
+const XHS_UID_PATTERN = /^[0-9a-f]{16,64}$/;
 
 /**
  * Tables only. Created before any index so an older database can gain missing
@@ -247,8 +250,8 @@ function normalizeFlag(value) {
 /** Reject uid values that could escape the export tree. */
 function assertUid(uid) {
   const text = asText(uid);
-  if (!UID_PATTERN.test(text)) {
-    throw new StoreError('invalid_account', 'Account uid must be a decimal string.', 400);
+  if (!UID_PATTERN.test(text) && !XHS_UID_PATTERN.test(text)) {
+    throw new StoreError('invalid_account', 'Account uid must be a decimal or lowercase-hex string.', 400);
   }
   return text;
 }
@@ -367,7 +370,16 @@ async function* readJsonLines(file) {
   }
 }
 
-/** Normalise one imported JSONL row into flat columns plus its metadata. */
+/** Normalise one imported JSONL row into flat columns plus its metadata.
+ *
+ * Two export layouts are supported, selected per row by field name:
+ *  - Duoshan: msg_uuid / sender / created_time / type
+ *  - Xiaohongshu: uuid / sender_id / create_time / content_type, where the
+ *    owning account is the "@" suffix of local_chat_user_id or
+ *    local_group_chat_id and the conversation key is the prefix before "@".
+ *    conversation_id therefore stays per-account unique (key + '@' + uid)
+ *    without breaking Duoshan ids, which never contain '@'.
+ */
 function normalizeRow(line) {
   const row = parseJsonLossless(line);
   if (!row || typeof row !== 'object' || Array.isArray(row)) {
@@ -377,6 +389,32 @@ function normalizeRow(line) {
     ? row._export
     : {};
   const text = typeof meta.text === 'string' ? meta.text : '';
+  const isXhs = row.msg_uuid === undefined
+    && (row.uuid !== undefined || row.content_type !== undefined);
+  if (isXhs) {
+    const groupKey = asText(row.local_group_chat_id);
+    const directKey = asText(row.local_chat_user_id);
+    const ownerField = groupKey.includes('@') ? groupKey
+      : (directKey.includes('@') ? directKey : '');
+    const at = ownerField.indexOf('@');
+    const owner = at >= 0 ? ownerField.slice(at + 1) : '';
+    const key = at >= 0 ? ownerField.slice(0, at) : (groupKey || directKey);
+    const isGroup = asInteger(row.is_group_chat) === 1 || (!directKey && !!groupKey);
+    return {
+      msg_uuid: asText(row.uuid),
+      conversation_id: key && owner ? key + '@' + owner : key,
+      conversation_name: asText(meta.conversation_name),
+      sender: asText(row.sender_id),
+      sender_name: asText(meta.sender_name),
+      created_time: asInteger(row.create_time),
+      time: asText(meta.time),
+      message_type: asInteger(row.content_type),
+      type_name: asText(meta.type_name),
+      text_original: text,
+      text_lower: text.toLowerCase(),
+      meta_json: stringifyJson({ ...meta, _xhs: { owner, key, is_group: isGroup } }),
+    };
+  }
   return {
     msg_uuid: asText(row.msg_uuid),
     conversation_id: asText(row.conversation_id),
@@ -405,6 +443,15 @@ function accountName(uid, statistics, contacts) {
       if (asText(contact.uid) !== uid) continue;
       const name = asText(contact.remark_name) || asText(contact.nickname)
         || asText(contact.display_name);
+      if (name) return name;
+    }
+  }
+  // Xiaohongshu layout: { user_table: [{user_id, nickname, ...}], ... }
+  if (Array.isArray(contacts?.user_table)) {
+    for (const contact of contacts.user_table) {
+      if (!contact || typeof contact !== 'object') continue;
+      if (asText(contact.user_id) !== uid) continue;
+      const name = asText(contact.nickname) || asText(contact.account_name);
       if (name) return name;
     }
   }
@@ -1449,7 +1496,8 @@ export class ChatStore {
   /** Account directories: `<output>/<decimal uid>/`. */
   #accountDirs() {
     return fs.readdirSync(this.#outputDir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() && UID_PATTERN.test(entry.name))
+      .filter((entry) => entry.isDirectory()
+        && (UID_PATTERN.test(entry.name) || XHS_UID_PATTERN.test(entry.name)))
       .map((entry) => entry.name)
       .sort();
   }

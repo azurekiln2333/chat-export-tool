@@ -531,7 +531,7 @@ def _export_account(config, output: Path, message_db_path: Path, uid: str,
                                             encoding='utf-8')
 
     times = [row.get('create_time') for row in message_rows if row.get('create_time')]
-    return {
+    summary = {
         'uid': uid,
         'nickname': own_name,
         'login_account': is_login_account,
@@ -544,6 +544,9 @@ def _export_account(config, output: Path, message_db_path: Path, uid: str,
         'message_types': dict(type_counts),
         'conversations': conv_summary,
     }
+    (account_dir / paths.ACCOUNT_FILES['statistics']).write_text(
+        dump(summary, pretty=True), encoding='utf-8')
+    return summary
 
 
 def _write_root(config, output: Path, summaries: list[dict], layout,
