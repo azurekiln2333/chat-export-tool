@@ -1,6 +1,6 @@
 <script setup>
 /** Application shell: boot, login gate and the reader layout. */
-import { onMounted, ref, watch } from 'vue';
+import { onMounted, ref, computed, watch } from 'vue';
 
 import ConfirmDialog from './ConfirmDialog.vue';
 import ConversationSidebar from './ConversationSidebar.vue';
@@ -9,8 +9,11 @@ import LoginPanel from './LoginPanel.vue';
 import MessagePane from './MessagePane.vue';
 import ToastStack from './ToastStack.vue';
 import { currentAccount, initialize, logout, reloadWorkspace, selectAccount, state } from '../store.js';
+import { appTitle } from '../utils.js';
 
 const sidebarOpen = ref(false);
+
+const title = computed(() => appTitle(state.appLabel));
 
 onMounted(() => {
   initialize();
@@ -50,7 +53,7 @@ function changeAccount(event) {
 
       <div class="brand">
         <span class="brand-mark"><Icon name="chat" :size="17" /></span>
-        <span>多闪聊天记录</span>
+        <span>{{ title }}</span>
       </div>
 
       <div class="header-actions">

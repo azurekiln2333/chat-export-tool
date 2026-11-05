@@ -379,8 +379,13 @@ async function* readJsonLines(file) {
  *    local_group_chat_id and the conversation key is the prefix before "@".
  *    conversation_id therefore stays per-account unique (key + '@' + uid)
  *    without breaking Duoshan ids, which never contain '@'.
+ *
+ * For Xiaohongshu rows, media referenced by the (nested-JSON) content is
+ * mapped through the export's ``media_manifest.json`` and any downloaded
+ * local file is recorded in ``meta.local_media`` so the reader renders the
+ * actual photos/videos instead of only text.
  */
-function normalizeRow(line) {
+function normalizeRow(line, localMedia = {}) {
   const row = parseJsonLossless(line);
   if (!row || typeof row !== 'object' || Array.isArray(row)) {
     throw new StoreError('invalid_source', MESSAGES_FILE + ' contains a line that is not a JSON object.', 500);
@@ -400,6 +405,17 @@ function normalizeRow(line) {
     const owner = at >= 0 ? ownerField.slice(at + 1) : '';
     const key = at >= 0 ? ownerField.slice(0, at) : (groupKey || directKey);
     const isGroup = asInteger(row.is_group_chat) === 1 || (!directKey && !!groupKey);
+    const localPaths = [];
+    const seenFiles = new Set();
+    for (const url of collectXhsMediaUrls(row)) {
+      const base = url.split('?')[0];
+      const file = localMedia[url] || localMedia[base] || '';
+      if (file && !seenFiles.has(file)) {
+        seenFiles.add(file);
+        localPaths.push(file);
+        if (localPaths.length >= 8) break;
+      }
+    }
     return {
       msg_uuid: asText(row.uuid),
       conversation_id: key && owner ? key + '@' + owner : key,
@@ -412,7 +428,11 @@ function normalizeRow(line) {
       type_name: asText(meta.type_name),
       text_original: text,
       text_lower: text.toLowerCase(),
-      meta_json: stringifyJson({ ...meta, _xhs: { owner, key, is_group: isGroup } }),
+      meta_json: stringifyJson({
+        ...meta,
+        local_media: localPaths,
+        _xhs: { owner, key, is_group: isGroup },
+      }),
     };
   }
   return {
@@ -429,6 +449,59 @@ function normalizeRow(line) {
     text_lower: text.toLowerCase(),
     meta_json: stringifyJson(meta),
   };
+}
+
+/* Xiaohongshu media extraction ------------------------------------------- */
+
+const XHS_URL_RE = /https:\/\/[^\s"'\\]+/g;
+const XHS_MEDIA_HOST_RE = /(msg-img\.|msg-video\.|sns-avatar-|sns-img\.|picasso-static|sns-na-i|image-url-2-feature|fe-video-qc|fe-platform\.)/;
+
+/** Yield every CDN media URL reachable from a parsed row.
+ *
+ * Xiaohongshu nests payloads several JSON layers deep (a ``content`` string
+ * holding JSON holding JSON...), where URLs appear escaped as
+ * ``https:\/\/...``; each string that parses as JSON is decoded and scanned
+ * so URLs are found at any depth with their real characters.
+ */
+function* collectXhsMediaUrls(node, depth = 0) {
+  if (depth > 12) return;
+  if (Array.isArray(node)) {
+    for (const value of node) yield* collectXhsMediaUrls(value, depth + 1);
+  } else if (node && typeof node === 'object') {
+    for (const value of Object.values(node)) yield* collectXhsMediaUrls(value, depth + 1);
+  } else if (typeof node === 'string') {
+    for (const match of node.matchAll(XHS_URL_RE)) {
+      const url = match[0].replace(/[",\]}]+$/, '');
+      if (XHS_MEDIA_HOST_RE.test(url)) yield url;
+    }
+    const text = node.trim();
+    if (text.startsWith('{') || text.startsWith('[')) {
+      try {
+        yield* collectXhsMediaUrls(parseJsonLossless(text), depth + 1);
+      } catch {
+        /* not JSON after all; the plain scan above already ran */
+      }
+    }
+  }
+}
+
+/** Build ``{url: attachments-relative path}`` from the export's
+ * ``media_manifest.json`` (query-less base keys included). */
+function localMediaMap(outputDir) {
+  try {
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(outputDir, 'media_manifest.json'), 'utf8'));
+    const media = manifest && typeof manifest.media === 'object' ? manifest.media : {};
+    const map = {};
+    for (const [url, record] of Object.entries(media)) {
+      if (!record || record.status !== 'ok' || typeof record.file !== 'string') continue;
+      map[url] = record.file;
+      map[url.split('?')[0]] = record.file;
+    }
+    return map;
+  } catch {
+    return {};
+  }
 }
 
 /** Resolve the display name for an account from statistics or contacts. */
@@ -580,6 +653,17 @@ export class ChatStore {
   /** Absolute export root this store serves. */
   get outputDir() {
     return this.#outputDir;
+  }
+
+  /** Exporting app recorded in `export_summary.json` ('Duoshan'|'Xiaohongshu'|''), so the UI can label itself instead of assuming Duoshan. */
+  appLabel() {
+    try {
+      const summary = JSON.parse(
+        fs.readFileSync(path.join(this.#outputDir, SUMMARY_FILE), 'utf8'));
+      return summary && typeof summary === 'object' ? asText(summary.app).trim() : '';
+    } catch {
+      return '';
+    }
   }
 
   /** Absolute path of the reader index. */
@@ -1559,6 +1643,7 @@ export class ChatStore {
    * Accounts that are not listed keep their existing rows and annotations.
    */
   async #importAll(accounts, fingerprint) {
+    const localMedia = localMediaMap(this.#outputDir);
     const insertMessage = this.#db.prepare(`
       INSERT OR REPLACE INTO messages (
         uid, msg_uuid, conversation_id, conversation_name, sender, sender_name,
@@ -1620,7 +1705,7 @@ export class ChatStore {
         insertAccount.run(uid, accountName(uid, statistics, contacts));
 
         for await (const line of readJsonLines(messagesPath)) {
-          const row = normalizeRow(line);
+          const row = normalizeRow(line, localMedia);
           if (!row.msg_uuid) continue;
           if (deleted.message.size
             && deleted.message.has(deletionHash('message', uid, row.msg_uuid))) continue;

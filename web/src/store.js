@@ -341,6 +341,7 @@ async function readSession() {
   state.authRequired = Boolean(session && session.auth_required);
   state.authenticated = Boolean(session && session.authenticated);
   state.csrfToken = (session && session.csrf_token) || '';
+  state.appLabel = (session && session.app_label) || '';
   setCsrfToken(state.csrfToken);
   return session;
 }

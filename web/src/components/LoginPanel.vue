@@ -1,10 +1,12 @@
 <script setup>
-import { ref } from 'vue';
+import { computed, ref } from 'vue';
 
 import Icon from './Icon.vue';
 import { login, state } from '../store.js';
+import { appTitle } from '../utils.js';
 
 const token = ref('');
+const title = computed(() => appTitle(state.appLabel));
 
 async function submit() {
   const value = token.value.trim();
@@ -19,7 +21,7 @@ async function submit() {
     <form class="login-card" autocomplete="off" @submit.prevent="submit">
       <div class="brand">
         <span class="brand-mark"><Icon name="chat" :size="17" /></span>
-        <span>多闪聊天记录</span>
+        <span>{{ title }}</span>
       </div>
       <p>此服务器需要访问口令。口令仅用于本次访问，不会出现在网址中。</p>
 

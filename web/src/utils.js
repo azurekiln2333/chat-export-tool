@@ -28,3 +28,9 @@ export function kindFromPath(path) {
   if (['mp4', 'mov', 'webm', 'mkv', 'm4v'].includes(ext)) return 'video';
   return 'file';
 }
+/** Reader window title per exporting app; never assumes Duoshan. */
+export function appTitle(label) {
+  if (label === 'Xiaohongshu') return '小红书聊天记录';
+  if (label === 'Duoshan') return '多闪聊天记录';
+  return '聊天记录';
+}

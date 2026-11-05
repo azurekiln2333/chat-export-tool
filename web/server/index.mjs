@@ -175,6 +175,7 @@ export async function createApp({ dataDir, databasePath, token = '', distDir = D
 
   function sessionResponse(session) {
     return { authenticated: Boolean(session), auth_required: authRequired,
+      app_label: store.appLabel(),
       ...(session ? { csrf_token: session.csrf } : {}) };
   }
 
