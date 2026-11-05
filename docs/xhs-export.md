@@ -90,16 +90,29 @@ directory per account with `chat.sqlite`, `messages.jsonl`, `messages.csv`,
 contacts, `conversation_metadata.json`, statistics, per-conversation HTML
 pages and TXT transcripts). Differences worth knowing:
 
-- **Media stays remote.** Xiaohongshu keeps IM images, videos and stickers
-  on its CDN (`msg-img.xhscdn.com`, ...); the backup contains no IM media
-  files, so nothing is downloaded and pages embed the original URLs
+- **Media is CDN-only in the backup.** Xiaohongshu keeps IM photos and videos
+  on its CDN (`msg-img.xhscdn.com`, `msg-video.xhscdn.com`); the backup
+  contains no IM media files, so a fresh export embeds the original URLs
   (displayed when online). Every URL is preserved verbatim in the JSONL,
   CSV and SQLite output.
+- **Downloading the media is a separate, opt-in step** (needs network access):
+
+  ```powershell
+  python -m duoshan_export.apps.xhs_media "D:\XhsChatExport" --workers 8
+  ```
+
+  It fetches every referenced photo/video once into `attachments/<uid>/`
+  (resumable; failures are recorded per URL), writes `media_manifest.json`
+  and, on the next `export`/re-render, the HTML pages embed the local files
+  so the whole archive works offline. The 1.5 GB DataBackup folder itself is
+  ~90% app program resources (React Native bundles, native libraries, filter
+  assets, logs) — the chat payload is small, which is why the initial export
+  is only tens of megabytes.
 - **`chat.sqlite` is the whole msgDB.** One decrypted database serves every
   exported account of the backup; rows of other accounts remain in it even
   though the HTML/CSV/JSONL views are filtered per account.
-- **`--download-media` / `media` do not apply.** The Xiaohongshu pipeline
-  finishes at export time and writes its own validation report; the
+- **`media` command / Duoshan decorations do not apply.** The Xiaohongshu
+  pipeline finishes at export time and writes its own validation report; the
   Duoshan-only media, decoration and web-reader stages are skipped.
 
 ## Verified against

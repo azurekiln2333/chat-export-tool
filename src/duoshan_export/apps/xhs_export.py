@@ -128,8 +128,16 @@ def _looks_like_image(url: str) -> bool:
 
 
 # --------------------------------------------------------------------- html
-def render_message(msg: dict, uid: str) -> str:
-    """One message article: header, bubble, remote media, raw JSON block."""
+def render_message(msg: dict, uid: str, local_media: dict[str, str] | None = None,
+                   depth: int = 2) -> str:
+    """One message article: header, bubble, media (local when downloaded),
+    remote links and the raw JSON block.
+
+    ``local_media`` maps a media URL to its export-root-relative path in
+    ``attachments/`` (from ``media_manifest.json``); when a URL is mapped the
+    page references the local file so the archive stays offline-viewable, and
+    the original URL is always kept in the link list and the raw block.
+    """
     raw, meta = msg['raw'], msg['meta']
     own = str(raw.get('sender_id')) == uid
     classes = 'message own' if own else 'message'
@@ -144,8 +152,27 @@ def render_message(msg: dict, uid: str) -> str:
     )
     urls = media_urls(msg.get('content'))
     images = [u for u in urls if _looks_like_image(u)]
+    videos = [u for u in urls if not _looks_like_image(u)
+              and ('msg-video.' in u or u.split('?')[0].lower().endswith(('.mp4', '.mov')))]
+    prefix = '../' * depth
+
+    def src_for(url: str) -> str:
+        # Exact match first, then the query-less base so resize/format
+        # variants (?imageView2/...) map to the same downloaded file.
+        media_map = local_media or {}
+        mapped = media_map.get(url) or media_map.get(url.split('?', 1)[0])
+        return quote(prefix + mapped) if mapped else e(url)
+
     for url in images[:4]:
-        body += '<p class="remote-media"><img loading="lazy" src="' + e(url) + '" alt=""></p>'
+        body += ('<p class="remote-media"><img loading="lazy" src="' + src_for(url)
+                 + '" alt=""'
+                 + ('' if (local_media or {}).get(url)
+                    else ' onerror="this.remove()"')
+                 + '></p>')
+    for url in videos[:2]:
+        mapped = (local_media or {}).get(url)
+        body += ('<p class="remote-media"><video controls preload="none" src="'
+                 + src_for(url) + '"></video></p>')
     if urls:
         body += '<details class="links"><summary>原始网络地址</summary><ul>'
         for index, url in enumerate(urls[:8], 1):
@@ -294,6 +321,9 @@ def export_chats(config, layout) -> dict:
     login_uid = xhs.login_user_id(source)
     login_name = _login_name(source, users)
 
+    from . import xhs_media
+
+    local_media = xhs_media.local_lookup(output)
     summaries = []
     for uid in wanted:
         summaries.append(_export_account(
@@ -301,7 +331,7 @@ def export_chats(config, layout) -> dict:
             [row for row in message_rows if _owner_of(row) == uid],
             chats, groups, users, user_rows, relation_rows,
             chat_rows, group_rows, chat_set_rows, msgheader_rows,
-            login_uid == uid, login_name))
+            login_uid == uid, login_name, local_media))
 
     summary = _write_root(config, output, summaries, layout, source)
     return {
@@ -348,7 +378,8 @@ def _export_account(config, output: Path, message_db_path: Path, uid: str,
                     user_rows: list[dict], relation_rows: list[dict],
                     chat_rows: list[dict], group_rows: list[dict],
                     chat_set_rows: list[dict], msgheader_rows: list[dict],
-                    is_login_account: bool, login_name: str) -> dict:
+                    is_login_account: bool, login_name: str,
+                    local_media: dict[str, str] | None = None) -> dict:
     """Write one account's reader tree and return its summary."""
     tzinfo = config.tzinfo
     tz_label = getattr(config, 'timezone', 'UTC') or 'UTC'
@@ -478,7 +509,7 @@ def _export_account(config, output: Path, message_db_path: Path, uid: str,
                          'placeholder="筛选本页正文或发送者"><a href="../'
                          + paths.DIRECTORIES['transcripts'] + '/' + quote(text_path.name)
                          + '">完整会话 TXT</a></div>' + nav)
-                body += ''.join(render_message(message, uid) for message in chunk) + nav
+                body += ''.join(render_message(message, uid, local_media) for message in chunk) + nav
                 (pages_dir / page_files[page_index]).write_text(
                     xhs_doc(conv_name, body, depth=2, search=True), encoding='utf-8')
 
@@ -601,7 +632,7 @@ def _write_root(config, output: Path, summaries: list[dict], layout,
 
 _XHS_STYLE_EXTRA = '''
 .remote-media{margin:8px 0}.remote-media img{max-width:min(100%,420px);border-radius:8px;display:block}
-.remote-media img:after{content:""}
+.remote-media video{max-width:min(100%,420px);border-radius:8px;display:block}
 '''
 
 
