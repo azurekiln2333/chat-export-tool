@@ -30,7 +30,11 @@ export function kindFromPath(path) {
 }
 /** Reader window title per exporting app; never assumes Duoshan. */
 export function appTitle(label) {
-  if (label === 'Xiaohongshu') return '小红书聊天记录';
-  if (label === 'Duoshan') return '多闪聊天记录';
+  const text = String(label || '');
+  const hasDuoshan = text.includes('Duoshan');
+  const hasXhs = text.includes('Xiaohongshu');
+  if (hasDuoshan && hasXhs) return '聊天记录 · 多闪 + 小红书';
+  if (hasXhs) return '小红书聊天记录';
+  if (hasDuoshan) return '多闪聊天记录';
   return '聊天记录';
 }
