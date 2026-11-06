@@ -26,6 +26,7 @@ import sqlite3
 import stat
 import sys
 from typing import Iterable
+from uuid import uuid4
 
 from .errors import ExportError
 
@@ -158,23 +159,6 @@ def _is_link_or_reparse(path: Path) -> bool:
     return bool(getattr(info, "st_file_attributes", 0) & _REPARSE_POINT)
 
 
-def _safe_rmtree(path: Path, root: Path) -> None:
-    """Delete ``path`` only when it is a real directory strictly inside ``root``."""
-    path = Path(path)
-    root = Path(root)
-    if _is_link_or_reparse(path):
-        raise ExportError(f"Refusing to delete a symlinked/reparse directory: {path}")
-    if not path.exists():
-        return
-    resolved = path.resolve()
-    owned = root.resolve()
-    if resolved == owned or not resolved.is_relative_to(owned):
-        raise ExportError(
-            f"Refusing to delete {path}: it is outside the tool-owned snapshot directory {root}"
-        )
-    shutil.rmtree(path)
-
-
 def _snapshot(path: Path, work_dir: Path) -> Path:
     """Copy ``path`` plus its WAL/journal into a private, fingerprint-checked snapshot."""
     if not path.is_file():
@@ -195,9 +179,8 @@ def _snapshot(path: Path, work_dir: Path) -> Path:
             meta = {}
         if meta.get("fingerprint") == fingerprint and meta.get("name") == path.name:
             return target
-    staging = snapshots_root / f".{key}.{os.getpid()}.tmp"
-    _safe_rmtree(staging, snapshots_root)
-    staging.mkdir(parents=True, exist_ok=True)
+    staging = snapshots_root / f".{key}.{os.getpid()}.{uuid4().hex[:12]}.tmp"
+    staging.mkdir(parents=True, exist_ok=False)
     try:
         shutil.copyfile(path, staging / path.name)
         for suffix in SIDECARS:
@@ -208,10 +191,21 @@ def _snapshot(path: Path, work_dir: Path) -> Path:
             json.dumps({"source": str(path), "name": path.name, "fingerprint": fingerprint}, ensure_ascii=False),
             encoding="utf-8",
         )
-        _safe_rmtree(root, snapshots_root)
-        staging.replace(root)
+        retained = None
+        if root.exists():
+            if _is_link_or_reparse(root):
+                raise ExportError(f"Refusing to replace a symlinked/reparse snapshot: {root}")
+            retained = root.with_name(root.name + ".retained-" + uuid4().hex[:12])
+            root.rename(retained)
+        try:
+            staging.rename(root)
+        except OSError:
+            if retained and retained.exists() and not root.exists():
+                retained.rename(root)
+            raise
     except BaseException:
-        _safe_rmtree(staging, snapshots_root)
+        # Retain partial snapshots for diagnosis, including ENOSPC/cancellation.
+        # A unique staging name lets the next attempt proceed without deletion.
         raise
     return root / path.name
 
@@ -334,9 +328,7 @@ def decrypt_database(source: os.PathLike[str] | str, uid: str,
         raise ExportError("Refusing to overwrite the source database with its decrypted copy.")
     snapshot = _snapshot(path, Path(work_dir))
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(destination.name + f".{os.getpid()}.tmp")
-    if temporary.exists():
-        temporary.unlink()
+    temporary = destination.with_name(destination.name + f".{os.getpid()}.{uuid4().hex[:12]}.tmp")
 
     plain_source = is_plain_sqlite(path)
     try:
@@ -375,11 +367,16 @@ def decrypt_database(source: os.PathLike[str] | str, uid: str,
             check = None  # release the handle before the atomic replace (Windows)
         if result != [("ok",)]:
             raise ExportError(f"Decrypted database failed its integrity check: {result!r}")
-        os.replace(temporary, destination)
+        retained = None
+        if destination.exists():
+            retained = destination.with_name(destination.name + ".retained-" + uuid4().hex[:12])
+            destination.rename(retained)
+        try:
+            temporary.rename(destination)
+        except OSError:
+            if retained and retained.exists() and not destination.exists():
+                retained.rename(destination)
+            raise
     except BaseException:
-        if temporary.exists():
-            try:
-                temporary.unlink()
-            except OSError:
-                pass
+        # Failed plaintext files remain available for inspection/recovery.
         raise

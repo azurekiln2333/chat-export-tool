@@ -16,6 +16,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 |-------|-------------|--------|
 | [Directory Structure](./directory-structure.md) | Module organization and file layout | To fill |
 | [Export Contract](./export-contract.md) | CLI/API, raw data, media and validation contracts | Implemented |
+| [Unified Import](./unified-import.md) | Three-app detection, source protection, incremental stages and retained history | Implemented |
 | [Database Guidelines](./database-guidelines.md) | Snapshots, SQLCipher, handles and owned indexes | Implemented |
 | [Node SQLite Reader](./web-reader.md) | Vue service, exact imports, reversible edits, portable media and HTTP | Implemented |
 | [Error Handling](./error-handling.md) | Error types, handling strategies | To fill |

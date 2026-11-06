@@ -34,9 +34,19 @@ def _json_flag(parser: argparse.ArgumentParser) -> None:
 
 
 def _app_flag(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--app", choices=["auto", "duoshan", "xhs"], default="auto",
+    parser.add_argument("--app", choices=["auto", "duoshan", "xhs", "wechat"], default="auto",
                         help="App rules to apply (default: auto-detect; 'auto' keeps Duoshan "
                              "behaviour for Duoshan backups and switches only for Xiaohongshu data)")
+
+
+def _wechat_key_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--wechat-password", help="Optional WeChat database password when backup key discovery is insufficient")
+    parser.add_argument("--wechat-imei", help="Optional original WeChat device IMEI for key derivation")
+    parser.add_argument("--wechat-uin", help="Optional original WeChat UIN (signed integer)")
+
+
+def _wechat_key_options(args) -> dict:
+    return {name: getattr(args, "wechat_" + name, None) for name in ("password", "imei", "uin")}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -48,6 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("--work-dir", type=_path, help="Extraction/snapshot directory (default: a temporary directory)")
     inspect.add_argument("--sqlcipher-module-path", type=_path)
     _app_flag(inspect)
+    _wechat_key_flags(inspect)
     _json_flag(inspect)
 
     export = commands.add_parser("export", help="Create a portable export; networking is opt-in")
@@ -62,6 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("--decode-media", action="store_true", help="Also decode media during final validation")
     _common_runtime(export)
     _app_flag(export)
+    _wechat_key_flags(export)
     _json_flag(export)
 
     media = commands.add_parser("media", help="Reuse/download media, rebuild the reader and refresh the SQLite media index")
@@ -83,6 +95,39 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--ffmpeg", default="ffmpeg")
     doctor.add_argument("--ffprobe", default="ffprobe")
     _json_flag(doctor)
+
+    scan = commands.add_parser("scan", help="Detect/inspect WeChat, Duoshan and Xiaohongshu backup folders")
+    scan.add_argument("sources", nargs="+", type=_path)
+    scan.add_argument("--inspect", action="store_true", help="Also decrypt databases and count accounts/messages")
+    scan.add_argument("--work-dir", type=_path, default=Path.cwd() / "ChatImportWork")
+    scan.add_argument("--sqlcipher-module-path", type=_path)
+    _wechat_key_flags(scan)
+    _json_flag(scan)
+
+    merge = commands.add_parser("import", help="Incrementally import separate or newer backups into one reader library")
+    merge.add_argument("sources", nargs="+", type=_path)
+    merge.add_argument("-o", "--output", type=_path, required=True)
+    merge.add_argument("--work-dir", type=_path, help="Retained extraction/work cache (default: OUTPUT.work beside the library)")
+    merge.add_argument("--timezone", default="Asia/Shanghai")
+    merge.add_argument("--download-media", action="store_true")
+    merge.add_argument("--sqlcipher-module-path", type=_path)
+    merge.add_argument("--node", default="node", help="Node.js executable for reader merge")
+    _wechat_key_flags(merge)
+    _json_flag(merge)
+
+    organize = commands.add_parser("organize", aliases=["adopt"], help="Adopt an existing reader library and prefix account folders by app")
+    organize.add_argument("output", type=_path)
+    organize.add_argument("--node", default="node")
+    _json_flag(organize)
+
+    library_media = commands.add_parser("library-media", help="Download missing recorded media directly from a reader library")
+    library_media.add_argument("output", type=_path)
+    library_media.add_argument("--work-dir", type=_path, help="Retained processing logs and metadata patches outside the library (default: OUTPUT.work)")
+    library_media.add_argument("--account", action="append", default=[], metavar="UID")
+    library_media.add_argument("--workers", type=int, default=6)
+    library_media.add_argument("--node", default="node")
+    library_media.add_argument("--download-media", action="store_true", help="Required explicit consent for online media retrieval")
+    _json_flag(library_media)
     return parser
 
 
@@ -124,6 +169,26 @@ def _export(args) -> dict:
     from .media_index import index_media
     from .validation import validate_export
 
+    if args.app == "wechat":
+        from .apps.wechat import export_backup
+        work = args.work_dir or args.output / ".work"
+        if args.output.exists() and any(args.output.iterdir()):
+            raise ExportError("For an existing library or a newer backup, use the import command. WeChat export needs an empty output.")
+        return export_backup(args.source, args.output, work, timezone=args.timezone,
+                             sqlcipher_module_path=args.sqlcipher_module_path, **_wechat_key_options(args))
+    # Explicit/recognizable WeChat input uses its isolated adapter before the
+    # original Duoshan/XHS preparation paths. Their behavior is unchanged.
+    if args.app == "auto":
+        from .library import discover_sources
+        try:
+            detected = discover_sources([args.source])
+        except ExportError:
+            detected = []
+        if len(detected) == 1 and detected[0]["app"] == "wechat":
+            args.app = "wechat"
+            return _export(args)
+        if any(item["app"] == "wechat" for item in detected):
+            raise ExportError("This selection contains multiple backup sources. Use the import command to combine them safely.")
     config = _config(args)
     state = begin_export(config)
     print("Preparing source backup...", flush=True)
@@ -209,6 +274,17 @@ def _inspect(args) -> dict:
     from .source import prepare_source, discover_accounts
     from .apps import resolve_app
     from .database import open_database
+
+    if args.app in {"auto", "wechat"}:
+        from .library import discover_sources, inspect_sources
+        try:
+            detected = discover_sources([args.source])
+        except ExportError:
+            detected = []
+        if args.app == "wechat" or any(item["app"] == "wechat" for item in detected):
+            work = args.work_dir or Path(tempfile.mkdtemp(prefix="wechat-inspect-"))
+            return inspect_sources([args.source], work, sqlcipher_module_path=args.sqlcipher_module_path,
+                                   **_wechat_key_options(args))
 
     def inspect_at(work):
         layout = prepare_source(args.source, work)
@@ -324,6 +400,24 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _dispatch(args) -> dict:
+    if args.command == "library-media":
+        from .library_media import download_library_media
+        return download_library_media(args.output, args.work_dir or args.output.with_name(args.output.name + ".work"),
+            accounts=args.account or None, workers=args.workers, node=args.node, download_media=args.download_media)
+    if args.command == "scan":
+        from .library import discover_sources, inspect_sources
+        if args.inspect:
+            return inspect_sources(args.sources, args.work_dir,
+                                   sqlcipher_module_path=args.sqlcipher_module_path, **_wechat_key_options(args))
+        return {"status": "detected", "sources": discover_sources(args.sources)}
+    if args.command == "import":
+        from .library import import_sources
+        return import_sources(args.sources, args.output, args.work_dir or args.output.with_name(args.output.name + ".work"),
+            timezone=args.timezone, download_media=args.download_media,
+            sqlcipher_module_path=args.sqlcipher_module_path, node=args.node, **_wechat_key_options(args))
+    if args.command in {"organize", "adopt"}:
+        from .library import organize_library
+        return organize_library(args.output, node=args.node)
     if args.command == "export":
         return _export(args)
     if args.command == "media":

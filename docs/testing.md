@@ -145,3 +145,34 @@ reversible persistent edits, revision conflicts, media migration/ranges,
 authentication/CSRF/proxy origins, contained paths and bounded shutdown.
 See [web-reader.md](web-reader.md) for the test contract, data model and HTTP API,
 and [deployment.md](deployment.md) for the deployment paths and procedures.
+
+## Unified importer and WeChat
+
+`test_library.py` exercises source detection, separate app imports, repeated and
+overlapping snapshots, preserved annotations/history, source path containment,
+content-addressed media and failed metadata publication. `test_wechat.py`
+constructs plaintext and SQLCipher/4000/no-HMAC databases, committed WAL rows,
+negative binary UIN key material, account-isolated media and zstd archives.
+It also runs real SILK encode/decode and WXGF/HEVC-to-PNG conversion fixtures,
+then verifies the original bytes and actual decoded media. Wrong keys,
+unsupported schemas and corrupted caches must fail or recover explicitly.
+
+`test_database_retention.py` and `test_source_retention.py` inject partial copy,
+malformed archive member and metadata failures. Retries must retain incomplete
+artifacts and previous outputs without permanently deleting them. All fixtures
+live in the OS temporary directory outside the protected analysis workspace;
+real message/media samples must never be copied into the repository.
+
+`test_library_media.py` intercepts every network request. It verifies live
+three-app reader imports through the actual Node metadata patcher, signed-URL
+fallbacks, redirect/domain boundaries, byte limits, expired/encrypted resources,
+cancellation and recovery, deletion races, source-folder protection, cached
+local verification and post-import Live Photo media. Generated video/audio
+fixtures test decoder validation, retained originals, and successful publication
+without a second media copy in work. It also proves stale JSONL does not restore
+deleted messages and that raw JSON, annotations and deletion records survive.
+Fresh-directory concurrency tests verify that successful workers still journal
+and attach when another fails, and that retry handles only the failed resource.
+Path rejection tests verify local diagnostics and isolation between apps. SILK
+decoder output must not undergo a redundant WAV conversion; image conversion
+must close its source before atomic publication on Windows.

@@ -48,6 +48,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { DatabaseSync } from 'node:sqlite';
 import JSONbigFactory from 'json-bigint';
+import { accountDirectories, accountDirectory } from './account-layout.mjs';
 
 const JSONbig = JSONbigFactory({ storeAsString: true, useNativeBigInt: false });
 
@@ -146,6 +147,12 @@ CREATE TABLE IF NOT EXISTS deletions (
   key_hash   TEXT NOT NULL,
   deleted_at TEXT NOT NULL,
   PRIMARY KEY (kind, key_hash)
+);
+
+CREATE TABLE IF NOT EXISTS library_accounts (
+  uid TEXT PRIMARY KEY,
+  app TEXT NOT NULL,
+  directory TEXT NOT NULL
 );
 `;
 
@@ -385,10 +392,24 @@ async function* readJsonLines(file) {
  * local file is recorded in ``meta.local_media`` so the reader renders the
  * actual photos/videos instead of only text.
  */
-function normalizeRow(line, localMedia = {}) {
+export function normalizeRow(line, localMedia = {}) {
   const row = parseJsonLossless(line);
   if (!row || typeof row !== 'object' || Array.isArray(row)) {
     throw new StoreError('invalid_source', MESSAGES_FILE + ' contains a line that is not a JSON object.', 500);
+  }
+  // A managed-library projection may carry canonical alias IDs and unioned
+  // attachment metadata alongside the untouched source fields. Ordinary app
+  // exports never use this explicit, versioned envelope.
+  const projection = row._library_projection;
+  if (projection?.version === 1) {
+    const fields = ['msg_uuid', 'conversation_id', 'conversation_name', 'sender',
+      'sender_name', 'time', 'type_name', 'text_original', 'text_lower', 'meta_json'];
+    if (!fields.every(key => typeof projection[key] === 'string')
+      || ![projection.created_time, projection.message_type].every(value => value === null || Number.isSafeInteger(value))
+      || !parseJsonLossless(projection.meta_json)) {
+      throw new StoreError('invalid_source', 'Invalid library projection.', 500);
+    }
+    return Object.fromEntries([...fields, 'created_time', 'message_type'].map(key => [key, projection[key]]));
   }
   const meta = row._export && typeof row._export === 'object' && !Array.isArray(row._export)
     ? row._export
@@ -689,6 +710,12 @@ export class ChatStore {
     this.#dayFormatter = undefined;
 
     const force = normalizeFlag(options.force);
+    // A managed library is updated through additive imports. Its JSONL files
+    // are projections, so a stale/interrupted projection must never replace
+    // the authoritative database or erase history absent from a new backup.
+    if (this.#getMeta('library_mode') === 'incremental-v1') {
+      return { ...this.#counts(), imported: false, fingerprint: this.#getMeta('fingerprint') };
+    }
     const importable = this.#importableAccounts();
     const counts = this.#counts();
     if (!importable.length) {
@@ -716,6 +743,7 @@ export class ChatStore {
     const rows = this.#guard(() => this.#db.prepare(`
       SELECT a.uid AS uid,
              a.name AS name,
+             COALESCE((SELECT app FROM library_accounts l WHERE l.uid=a.uid), '') AS source_app,
              (SELECT COUNT(*) FROM messages m WHERE m.uid = a.uid) AS message_count,
              (SELECT COUNT(*) FROM conversations c WHERE c.uid = a.uid) AS conversation_count
       FROM accounts a
@@ -723,6 +751,7 @@ export class ChatStore {
     return rows.map((row) => ({
       uid: row.uid,
       name: row.name || row.uid,
+      source_app: row.source_app || '',
       message_count: asInteger(row.message_count) ?? 0,
       conversation_count: asInteger(row.conversation_count) ?? 0,
     }));
@@ -1579,11 +1608,7 @@ export class ChatStore {
 
   /** Account directories: `<output>/<decimal uid>/`. */
   #accountDirs() {
-    return fs.readdirSync(this.#outputDir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory()
-        && (UID_PATTERN.test(entry.name) || XHS_UID_PATTERN.test(entry.name)))
-      .map((entry) => entry.name)
-      .sort();
+    return accountDirectories(this.#outputDir).map(account => account.uid);
   }
 
   /**
@@ -1593,7 +1618,7 @@ export class ChatStore {
    */
   #importableAccounts() {
     return this.#accountDirs().filter((uid) => {
-      const file = path.join(this.#outputDir, uid, MESSAGES_FILE);
+      const file = path.join(accountDirectory(this.#outputDir, uid), MESSAGES_FILE);
       return fs.existsSync(file) && fs.statSync(file).isFile();
     });
   }
@@ -1610,9 +1635,9 @@ export class ChatStore {
     const files = [];
     for (const uid of accounts) {
       for (const name of [MESSAGES_FILE, STATISTICS_FILE, CONTACTS_FILE]) {
-        const file = path.join(this.#outputDir, uid, name);
+        const file = path.join(accountDirectory(this.#outputDir, uid), name);
         if (fs.existsSync(file) && fs.statSync(file).isFile()) {
-          files.push(path.join(uid, name).replace(/\\/g, '/'));
+          files.push(path.relative(this.#outputDir, file).replace(/\\/g, '/'));
         }
       }
     }
@@ -1692,7 +1717,7 @@ export class ChatStore {
     this.#db.exec('BEGIN IMMEDIATE');
     try {
       for (const uid of accounts) {
-        const directory = path.join(this.#outputDir, uid);
+        const directory = accountDirectory(this.#outputDir, uid);
         const messagesPath = path.join(directory, MESSAGES_FILE);
 
         // Replace this account's rows; other accounts and all annotations in
@@ -1878,5 +1903,10 @@ export class ChatStore {
     return this.getMessage(uid, msgUuid);
   }
 }
+
+// The incremental importer shares the exact legacy normalization, calendar,
+// ID and deletion contracts instead of maintaining a second adapter.
+export { accountName, dayFromTimeText, deletionHash, hashFile, localMediaMap,
+  parseJsonLossless, readJsonFile, readJsonLines, stringifyJson };
 
 export default ChatStore;

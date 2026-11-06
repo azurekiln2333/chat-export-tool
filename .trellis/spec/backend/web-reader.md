@@ -150,3 +150,65 @@ route, while permanent DELETE always requires `confirm_delete:true`.
 
 Wrong: add `day`, commit, then backfill. Correct: add/backfill/update markers
 in one transaction so an interrupted upgrade retries cleanly.
+
+## Managed-library media updates
+
+`library-media.mjs` is the separate metadata-only boundary used after explicit
+media downloading. Do not call the message importer to attach files, and do
+not initialize from JSONL: it may still contain messages the user deleted.
+Require an existing database with `library_mode=incremental-v1`.
+
+```js
+patchLibraryMedia({outputDir, updatesFile, sourceId = '', project = true})
+resumeLibraryMedia({outputDir})
+```
+
+CLI: `node server/library-media.mjs --output LIBRARY --updates PATCH.jsonl
+[--source-id ID] [--json]`. Use `--resume` instead of `--updates` to publish
+pending projections without the original patch file. `--no-project` commits
+metadata while deliberately leaving its projection pending.
+
+Each JSONL row requires string `uid`/`msg_uuid` and at least one of
+`local_media`, `original_media`, `media`, or `media_status`. Optional `app` and
+`expected_raw_sha256` guard against a changed message during downloading.
+The digest is SHA-256 of the exact UTF-8 `raw_json`. Other fields are rejected.
+The resource `media` is a flat object (`kind`, `status`, `path`, optional
+`bytes`, `sha256`, `mime`, `format`, codec details). Successful resources need
+`kind` and `path`. Local media lists contain strings only; resolve all new
+paths under the real library `attachments` directory, rejecting traversal,
+alternate streams and escaping junctions. Check supplied size/hash values.
+
+Inside one immediate transaction, resolve only the live `(uid,msg_uuid)` row,
+check app/raw digest and message/conversation deletion hashes, and skip
+missing, stale or suppressed rows. Never insert messages, change identities,
+or modify raw content, other message columns, edits or deletion rows. Use
+SQLite `json_set` for the allowlisted media paths so unrelated metadata values
+including unsafe integer literals do not pass through a JavaScript numeric
+round trip. Keep unchanged `meta_json` byte-for-byte.
+
+Union local/original paths without duplicates. Keep an existing valid primary
+resource when later resources belong to the same message (photo/live video,
+video/poster), appending the additional resource path to `local_media`.
+Repeated resource ordering must not toggle the primary or reproject unchanged
+accounts. A missing or corrupt primary may be replaced; its file-specific
+kind/codec/format details must not leak into the replacement. Failed attempts
+cannot downgrade an existing successful resource.
+
+`library_media_batches` durably records a patch-content fingerprint, source,
+result, affected accounts and pending/completed projection status. Repeating
+the identical batch does not apply metadata again. A new invocation and
+`--resume` both finish prior pending projections from the current database;
+messages deleted since the original commit stay absent. The publisher retains
+previous files. Report `patched_messages`, `unchanged_messages`,
+`skipped_messages`, `repeated`, affected `accounts`, and `projection_status`.
+
+`library-media.test.mjs` independently verifies exact non-media preservation,
+unsafe numeric/raw literals, cross-app identity guards, deleted/stale skips,
+semantic and fingerprint idempotence, multi-resource primary stability,
+corrupt-primary replacement, whole-batch rollback on bad paths/types/hashes,
+junction containment, interrupted projection retry and CLI recovery. Use
+synthetic temporary directories outside the protected analysis workspace.
+The live HTTP integration starts the reader before a separate-process media
+patch, then checks fresh message API data and local attachment bytes through
+the same running server, with original content and user edits unchanged.
+It must not restart the server or reindex to observe the new media.

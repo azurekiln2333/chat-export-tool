@@ -21,10 +21,10 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import stat
 import tarfile
 from typing import Iterator
+from uuid import uuid4
 
 from .errors import ExportError
 
@@ -266,14 +266,14 @@ def _ensure_owned_dir(path: Path, root: Path) -> None:
         )
 
 
-def _remove_owned_tree(path: Path, root: Path) -> None:
-    """Delete ``path`` only when it is a real directory strictly inside ``root``."""
+def _retain_owned_tree(path: Path, root: Path) -> None:
+    """Retain an old extraction beside its replacement without deleting it."""
     if _is_link_or_reparse(path):
-        raise ExportError(f"Refusing to delete a symlinked/reparse directory: {path}")
+        raise ExportError(f"Refusing to replace a symlinked/reparse directory: {path}")
     if not path.exists():
         return
     _ensure_owned_dir(path, root)
-    shutil.rmtree(path)
+    path.rename(path.with_name(path.name + ".retained-" + uuid4().hex[:12]))
 
 
 def _archive_fingerprint(path: Path) -> str:
@@ -295,10 +295,10 @@ def extract_archive(archive: Path, destination: Path, *, relevant_only: bool = T
     """Safely extract a tar/tar.zst ``archive`` into ``destination``.
 
     When ``root`` is given, ``destination`` must live strictly inside it and all
-    deletions are scoped to that tool-owned tree. An existing non-empty
+    replacements are scoped to that tool-owned tree. An existing non-empty
     ``destination`` is only replaced when it carries a valid tool marker; an
     unrelated user directory or a symlinked/reparse target is refused rather than
-    deleted. Repeated calls with the same archive reuse the earlier extraction
+    changed. Prior tool-owned extractions are retained by rename. Repeated calls with the same archive reuse the earlier extraction
     when its fingerprint matches, so a changed archive is always extracted afresh.
     """
     archive = Path(archive)
@@ -323,13 +323,13 @@ def extract_archive(archive: Path, destination: Path, *, relevant_only: bool = T
         if any(destination.iterdir()):
             if meta is None:
                 raise ExportError(
-                    f"Refusing to delete a non-empty directory that was not created by this tool: {destination}. "
-                    "Remove it manually or choose a different work directory."
+                    f"Refusing to replace a non-empty directory that was not created by this tool: {destination}. "
+                    "Choose a different work directory."
                 )
             if root is not None:
-                _remove_owned_tree(destination, root)
+                _retain_owned_tree(destination, root)
             else:
-                shutil.rmtree(destination)
+                destination.rename(destination.with_name(destination.name + ".retained-" + uuid4().hex[:12]))
     destination.mkdir(parents=True, exist_ok=True)
 
     stats = {"archive": archive, "extracted": 0, "bytes": 0, "skipped": [], "reused": False}
@@ -365,7 +365,8 @@ def extract_archive(archive: Path, destination: Path, *, relevant_only: bool = T
                 _ensure_within(target, destination)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 written = 0
-                with target.open("wb") as output:
+                partial = target.with_name(target.name + ".partial-" + uuid4().hex[:12])
+                with partial.open("xb") as output:
                     output.write(head)
                     written += len(head)
                     while True:
@@ -376,10 +377,12 @@ def extract_archive(archive: Path, destination: Path, *, relevant_only: bool = T
                         if written > member.size:
                             break
                         output.write(chunk)
-                if written > member.size:
-                    target.unlink(missing_ok=True)
+                if written != member.size:
                     stats["skipped"].append(f"{member.name} (truncated)")
                     continue
+                if target.exists():
+                    target.rename(target.with_name(target.name + ".retained-" + uuid4().hex[:12]))
+                partial.rename(target)
                 stats["extracted"] += 1
                 stats["bytes"] += written
     marker = destination / ".extracted.json"
