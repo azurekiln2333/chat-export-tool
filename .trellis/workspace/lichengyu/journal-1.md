@@ -49,3 +49,24 @@ Delivered reader 0.2.0 with atomic single/bulk SQL deletion of messages/conversa
 ### Status
 
 [OK] **Completed**
+
+
+## Session 3: Media diagnostics and library navigation
+
+**Date**: 2026-11-07
+**Commit**: `3449340` — feat(gui): add library switching and detailed media results
+**Branch**: `master`
+
+Added local full-URL media reports and independent GUI details, library selection
+and managed-reader reload, source labels in desktop/web account lists, and clear
+media availability text. Removed the directory-explanation card. Verified offline
+report privacy, metadata patch boundaries, real synthetic reader switching and
+source preservation. Original backups and running user downloads were untouched.
+
+Validation: Python199 (187passed,12optionalQt skips), installed Qt16/16,
+Node162/162 plus final legacy-source29/29, production build, offscreen Qt
+visual inspection and synthetic HTTP/service integration passed.
+
+Task evidence is completed and retained in place. Standard archive/finish scripts
+unlink runtime session files, so workspace no-permanent-deletion rules take
+precedence. No task/runtime file was removed.
