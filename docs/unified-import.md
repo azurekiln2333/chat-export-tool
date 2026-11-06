@@ -122,8 +122,9 @@ not messages; one resource may be referenced by many messages, and one message
 may have both a photo and video. Local journals and result details preserve
 full recorded URLs and per-attempt request/redirect results, including signed
 query strings explicitly requested for diagnosis. Cryptographic key fields
-remain excluded. Progress messages explain reason codes without printing URL
-lists. These private reports/journals must stay outside the source repository.
+remain excluded. Progress messages directly print status-prefixed full URLs
+with reasons, alongside aggregate counters. These private logs, reports and
+journals must stay outside the source repository.
 
 ### Read media details without downloading
 

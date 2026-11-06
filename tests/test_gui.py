@@ -216,15 +216,85 @@ class MediaControlsTests(unittest.TestCase):
 
     def test_media_worker_error_restores_controls(self):
         window = self.window
-        self.download.side_effect = RuntimeError("fixture unavailable")
+        window.password_edit.setText("fixture-error-secret")
+        self.download.side_effect = RuntimeError("fixture unavailable fixture-error-secret")
         window.library_download_check.setChecked(True)
         window.library_download_button.click()
         self.wait_for_worker()
         self.assertEqual(window.last_result["status"], "error")
         self.assertIn("fixture unavailable", window.result_view.toPlainText())
+        self.assertNotIn("fixture-error-secret", window.result_view.toPlainText())
+        self.assertNotIn("fixture-error-secret", window.log_view.toPlainText())
         self.assertTrue(window.library_download_button.isEnabled())
         self.assertFalse(window.history_cancel_button.isEnabled())
         self.assertEqual(window.history_progress.value(), 0)
+
+    def test_live_worker_log_keeps_full_signed_urls_and_compact_summary(self):
+        window = self.window
+        window.password_edit.setText("fixture-private-password")
+        window.uin_edit.setText("fixture-private-uin")
+        window.imei_edit.setText("fixture-private-imei")
+        long_url = "https://media.example.invalid/image?signature=" + "abc%2Fxyz%2B" * 350 + "&markup=<b>literal</b>&expires=9999999999&token=fixture-private-password-fixture-private-uin-fixture-private-imei"
+        redirect_url = "https://cdn.example.invalid/image?token=exact%3D%2F%2B-fixture-private-uin&x=1"
+        lines = [
+            f"[✓]{long_url} | 下载成功",
+            f"[=]{redirect_url} | 已有本地文件（记录候选，未发起新请求）",
+            f"[x]{redirect_url} | 失败：服务器返回 HTTP 403，拒绝访问",
+            f"[!]{redirect_url} | 不支持：地址不在支持范围（未发起请求）",
+            f"[→]{long_url} | HTTP 302 重定向至 {redirect_url}",
+            "[!]无 URL | 不支持：备份未记录视频下载网址",
+        ]
+        summary = "媒体进度 6/9 · 成功 1 · 已有 1 · 失败 1 · 不支持 3"
+        emitted = threading.Event()
+        release = threading.Event()
+
+        def download(*args, **kwargs):
+            kwargs["progress"]("凭据测试 fixture-private-password fixture-private-uin fixture-private-imei")
+            kwargs["progress"]("普通日志 https://media.example.invalid/normal?sign=fixture-private-password")
+            print("[x]https://media.example.invalid/stdout?sign=fixture-private-uin | 原始输出 fixture-private-password")
+            kwargs["progress"](summary)
+            for line in lines:
+                kwargs["progress"](line)
+            kwargs["progress"](f"[x]{redirect_url} | 失败详情 fixture-private-password fixture-private-imei")
+            kwargs["progress"]("[!]无 URL | 缺失详情 fixture-private-password")
+            emitted.set()
+            while not release.is_set() and not kwargs["cancel"]():
+                time.sleep(0.01)
+            return {"status": "completed", "totals": {
+                "downloaded": 1, "existing": 1, "failed": 1, "unsupported": 3}}
+
+        self.download.side_effect = download
+        with patch.object(QDesktopServices, "openUrl") as opener, patch("urllib.request.urlopen") as network:
+            window.library_download_check.setChecked(True)
+            window.library_download_button.click()
+            try:
+                self.wait_for_event(emitted)
+                QTest.qWait(30)
+                self.assertTrue(window.worker.isRunning(), "URLs must be visible before download completion")
+                log = window.log_view.toPlainText()
+                for line in lines:
+                    self.assertIn(line, log)
+                self.assertIn("<b>literal</b>", log)
+                self.assertIn("凭据测试 [已隐藏] [已隐藏] [已隐藏]", log)
+                self.assertIn("普通日志 https://media.example.invalid/normal?sign=[已隐藏]", log)
+                self.assertIn("[x]https://media.example.invalid/stdout?sign=[已隐藏] | 原始输出 [已隐藏]", log)
+                self.assertIn(f"[x]{redirect_url} | 失败详情 [已隐藏] [已隐藏]", log)
+                self.assertIn("[!]无 URL | 缺失详情 [已隐藏]", log)
+                outside_urls = log.replace(long_url, "<URL>").replace(redirect_url, "<URL>")
+                for secret in ("fixture-private-password", "fixture-private-uin", "fixture-private-imei"):
+                    self.assertNotIn(secret, outside_urls)
+                self.assertEqual(window.status_label.text(), summary)
+                self.assertEqual(window.history_status.text(), summary)
+                self.assertEqual(window.status_label.textFormat(), Qt.TextFormat.PlainText)
+                self.assertEqual(window.history_status.textFormat(), Qt.TextFormat.PlainText)
+                self.assertEqual(window.log_view.document().maximumBlockCount(), 5000)
+                opener.assert_not_called()
+                network.assert_not_called()
+            finally:
+                release.set()
+                self.wait_for_worker()
+        self.assertIn("成功 1", window.history_status.text())
+        self.assertIn(long_url, window.log_view.toPlainText())
 
     def test_history_cancel_reaches_worker_and_retains_completed_totals(self):
         entered = threading.Event()

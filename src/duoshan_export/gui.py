@@ -405,6 +405,26 @@ def create_window(*, sources=(), output=None, work=None):
         def _emit_log(self, value):
             self.log.emit(self._redact(str(value)))
 
+        def _emit_media_log(self, value):
+            # Only the download service's explicit resource-result callback may
+            # preserve URLs. Stdout, errors and all surrounding text stay redacted.
+            text = str(value)
+            head, separator, detail = text.partition(" | ")
+            marker, url = head[:3], head[3:]
+
+            def is_url(candidate):
+                return candidate.lower().startswith(("http://", "https://")) and not any(char.isspace() for char in candidate)
+
+            if not separator or marker not in ("[✓]", "[=]", "[x]", "[!]", "[→]") or not is_url(url):
+                self._emit_log(text)
+                return
+            safe_detail = self._redact(detail)
+            if marker == "[→]":
+                description, redirect, target = detail.partition(" 重定向至 ")
+                if redirect and description.startswith("HTTP ") and description[5:].isdigit() and is_url(target):
+                    safe_detail = self._redact(description + redirect) + target
+            self.log.emit(f"{marker}{url} | {safe_detail}")
+
         def run(self):
             writer = SignalWriter(self._emit_log)
             try:
@@ -419,7 +439,7 @@ def create_window(*, sources=(), output=None, work=None):
                     elif self.operation == "download":
                         from .library_media import download_library_media
                         result = download_library_media(self.options["output"], self.options["work"],
-                            progress=self._emit_log, cancel=self.cancel_event.is_set,
+                            progress=self._emit_media_log, cancel=self.cancel_event.is_set,
                             node=self.options["node"], workers=6,
                             download_media=self.options["library_download_media"])
                     else:
@@ -607,6 +627,7 @@ def create_window(*, sources=(), output=None, work=None):
             self.progress.setValue(0)
             layout.addWidget(self.progress)
             self.status_label = BodyLabel("准备就绪", card)
+            self.status_label.setTextFormat(Qt.TextFormat.PlainText)
             self.status_label.setWordWrap(True)
             layout.addWidget(self.status_label)
             self.import_page.body.addStretch()
@@ -681,6 +702,7 @@ def create_window(*, sources=(), output=None, work=None):
             self.history_progress.setValue(0)
             layout.addWidget(self.history_progress)
             self.history_status = BodyLabel("准备就绪", card)
+            self.history_status.setTextFormat(Qt.TextFormat.PlainText)
             self.history_status.setWordWrap(True)
             layout.addWidget(self.history_status)
             self.history_cancel_button = self._button("完成当前步骤后停止", self._cancel, card, busy=False)
@@ -768,6 +790,10 @@ def create_window(*, sources=(), output=None, work=None):
         def _log(self, text):
             stamp = datetime.now().strftime("%H:%M:%S")
             self.log_view.appendPlainText(f"[{stamp}] {text}")
+            # Resource URLs remain complete in the plain-text log; summary cards
+            # retain aggregate progress instead of wrapping long signed queries.
+            if str(text).lstrip().startswith(("[✓]", "[=]", "[x]", "[×]", "[!]", "[→]")):
+                return
             self.status_label.setText(str(text)[-240:])
             self.history_status.setText(str(text)[-240:])
 

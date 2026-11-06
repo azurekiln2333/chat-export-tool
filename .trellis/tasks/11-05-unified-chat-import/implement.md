@@ -33,3 +33,9 @@
 3. Verify selected-library changes, same-library reload, failed shutdown, invalid paths and no-managed-reader behavior. Check source labels and production reader build.
 4. Inspect reported emoji and a successful emoji through live SQLite and local HTTP only; improve unavailable wording without changing media retrieval behavior.
 5. Run final applicable regression checks, update specifications/evidence and commit/push the combined follow-up.
+
+## Direct URL log correction
+
+1. Format and emit full-URL status lines from completed download/reuse/unsupported/cancelled results with accurate attempt provenance.
+2. Verify backend callbacks and actual Qt worker/log rendering using intercepted network fixtures, including signed URLs, HTTP403, fallback, existing files and absent URLs.
+3. Update documentation/specification and record checks, then commit/push within prior authorization. Do not restart an active user download.

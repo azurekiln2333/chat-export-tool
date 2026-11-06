@@ -27,3 +27,7 @@ Store structured per-attempt diagnostics in local media journal/results, keeping
 Library selection refreshes the desktop summary and reloads only a reader process owned by the current GUI. Preserve its port so open reader pages can reload against the new library. Stop/restart asynchronously with a bounded wait; never discover and terminate unrelated Node processes. When no reader is managed, selection refreshes the library and the existing open action starts it. Provide an explicit reload for the same library. Ongoing import/download work keeps destination controls disabled.
 
 Account source labels come from `library_accounts.app`; legacy exports may use trustworthy account metadata or source-prefixed directories, with unknown sources remaining explicit. Add a desktop source column and reader account labels. Remove the directory-explanation card; keep storage documentation in the docs. Missing media labels describe recorded state without inventing server causes.
+
+## Direct download log URLs
+
+Emit explicit per-resource/attempt outcome lines through the existing progress callback after completion, alongside throttled aggregate counters. Distinguish recorded candidates from actual requests, redirects, cached files and missing URLs; do not mislabel unattempted fallback candidates. Keep full URLs as local plain text, never reader metadata. Bound GUI document size using the existing retained-journal/report model. No real media requests or process restarts for QA.

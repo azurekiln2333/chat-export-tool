@@ -35,3 +35,7 @@ Synthetic and real read-only checks cover detection, decryption, outgoing/incomi
 - Remove the entire directory-explanation card from the GUI.
 - Display account sources as `多闪/抖音`, `微信` or `小红书` in both the desktop library list and reader account list, using stored source metadata.
 - Diagnose the reported unavailable emoji using live data and download results. Distinguish recognition, local availability and failed downloads; do not claim a generic failure proves URL expiry.
+
+## Follow-up: per-resource URLs directly in task logs
+
+The user requires visible status-prefixed full URLs in the running download log, rather than only aggregate counts or a separate details dialog. Show successful, reused, failed and unsupported outcomes directly; retain full signed query strings and reasons. Missing URLs remain explicit. Preserve the current running downloader and existing retrieval behavior.

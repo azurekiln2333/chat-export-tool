@@ -60,6 +60,16 @@ in current library messages; expired or unsupported resources are reported.
 Refresh an already-open reader page to request the updated media references.
 No reader restart or reindex is required.
 
+The task log directly shows full URLs after each media outcome: `[✓] URL` for
+validated downloads, `[x] URL` with the failure reason, `[!] URL` for unsupported
+resources, and `[=] URL` for a reused local file. Missing addresses are shown as
+`[!] 无 URL` with the reason. Signed query strings are preserved. Recorded
+candidates, redirects and actual attempts remain distinguished; a cached file
+does not imply a new request. Aggregate counters continue alongside these lines.
+The GUI retains the latest 5,000 log lines; complete resource diagnostics remain
+available in the library journal and details reports. Code changes load when
+the GUI is reopened after the current task finishes.
+
 **查看媒体下载详情** is available on both the library and task pages. It reads
 the selected library and download journal offline, with no backup selection,
 working-directory setting or network opt-in required. It defaults to failed and

@@ -100,3 +100,12 @@ Paths reviewed for this commit:
 
 All private diagnostic reports, original data, live libraries, download results,
 settings and QA artifacts remain outside Git. No cleanup is part of this change.
+
+## Direct task-log correction: fix(media): show full URLs in live download logs
+
+The user clarified that every download outcome needs its full URL directly in
+the task log. Include `library_media.py`, `gui.py`, their focused tests, the
+unified-import specification, GUI/import/testing docs and this task's updated
+artifacts. Existing approval covers commit and push. Original backups, live
+libraries, runtime logs and private URLs remain excluded. The running GUI is
+not restarted for this logging-only correction.

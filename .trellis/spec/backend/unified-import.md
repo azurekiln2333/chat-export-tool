@@ -122,11 +122,20 @@ source, account, result and projection state. `store_meta.library_mode` is
   individual worker/path failure must be recorded without losing successful
   results from other workers. Record resolved-path diagnostics locally without
   exposing signed resource URLs in exception messages.
-- User-requested media details may display full recorded and attempted URLs,
-  preserving signed query strings. Keep them in local diagnostic reports and
-  journal/result fields, never in source-controlled fixtures, arbitrary
+- User-requested media details and direct download logs display full recorded
+  and attempted URLs, preserving signed query strings. Keep them in local task
+  logs, diagnostic reports and journal/result fields, never in source-controlled fixtures, arbitrary
   exception text or reader display metadata. Provide Chinese reason labels
   alongside stable machine codes. Missing URLs remain explicitly absent.
+- Emit status-prefixed per-attempt/resource URL lines directly through the
+  download progress callback, not only aggregate counters or a report link.
+  Use `[✓]` for a validated download, `[x]` for a failed attempt, `[!]` for
+  unsupported/no URL, and `[=]` for local reuse. Put the full URL immediately
+  after the prefix and the reason afterward. Redirects and candidates that
+  were not requested must not be presented as completed requests; reused
+  files must not replay historical failures as current attempts. Aggregate
+  progress stays throttled; direct outcome lines remain observable. The GUI
+  appends them as plain text without replacing compact aggregate status labels.
 - Offline diagnostic snapshots use the latest journal entry per resource and
   current live inventory. For legacy entries, reconstruct recorded candidates
   only; do not claim they were attempted. A partial final journal line is

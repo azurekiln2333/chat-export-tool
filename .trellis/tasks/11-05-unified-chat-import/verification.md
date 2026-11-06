@@ -114,3 +114,28 @@ Workspace retention: task evidence is retained in place. The standard archive
 command removes session files with unlink; it was not used because the parent
 AGENTS.md prohibits permanent deletion. Task completion is recorded without
 removing runtime or task files.
+
+
+## Direct full-URL log correction (2026-11-07)
+
+The user clarified that URLs must appear inline in the running task log. The
+previous report-only implementation did not satisfy that requirement. Each
+completed attempt/resource now emits a status-prefixed full URL, reason and
+accurate request/reuse context through the existing progress callback. Aggregate
+counters remain throttled. Long URL lines append as plain text without replacing
+the compact GUI status. No user download or GUI process was restarted.
+
+Backend focused tests: 34 passed, including signed query preservation, fallback
+failure then success, excluded unused alternatives, rejected redirect target,
+missing URLs, cached reuse without replay, cancellation, and coordinator-thread
+callbacks under six download workers. The test log is outside the repository:
+D:/AppData/Local/Temp/chat-media-live-url-tests-20261107-060638.log.
+
+Qt worker-to-log tests verify URL visibility while the mock download is still
+running, full long signed URLs, literal HTML text, no automatic URL visits and
+stable aggregate status. Controlled media callback URL portions preserve signed
+values even if a query contains a credential-like substring; surrounding text,
+stdout and arbitrary errors continue credential redaction. Original data and
+live libraries are unchanged. No Node or media acquisition behavior was changed.
+
+Final Qt run: 17/17 passed, including signed queries containing synthetic credential values and safe handling of surrounding text/stdout/errors. Legacy Windows redirected console output falls back to ASCII status markers if its encoding cannot print a checkmark; ASCII signed URLs remain unchanged.

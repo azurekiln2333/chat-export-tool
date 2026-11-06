@@ -65,8 +65,84 @@ class LibraryMediaTests(unittest.TestCase):
         return uid
 
     def run_download(self, session, **kwargs):
+        progress = kwargs.pop("progress", lambda _: None)
         with patch.object(media, "_session", return_value=session):
-            return media.download_library_media(self.library, self.work / "media", workers=1, progress=lambda _: None, download_media=True, **kwargs)
+            return media.download_library_media(self.library, self.work / "media", workers=1, progress=progress, download_media=True, **kwargs)
+
+    def test_live_url_log_preserves_signed_queries_and_fallback_outcomes_without_replaying_cached_attempts(self):
+        original = "http://p.douyinpic.com/original?signature=" + "a" * 3000 + "%2Bexact&x=<literal>"
+        fallback = "https://p.douyinpic.com/fallback?signature=full%2Ffallback"
+        unused = "https://p.douyinpic.com/unused?signature=never-requested"
+        self.add("duoshan", [{"type": 27, "content": {"resource_url": {"url_list": [original, fallback, unused]}}}])
+        logs = []
+        result = self.run_download(Session([Response(status=403), Response(png_bytes())]), progress=logs.append)
+        self.assertEqual(result["totals"]["downloaded"], 1)
+        url_lines = [line for line in logs if line.startswith("[")]
+        self.assertEqual(len(url_lines), 2)
+        self.assertTrue(url_lines[0].startswith("[x]https://" + original[7:] + " | 失败："))
+        self.assertIn("HTTP 403", url_lines[0])
+        self.assertEqual(url_lines[1], "[✓]" + fallback + " | 下载成功")
+        self.assertNotIn(unused, "\n".join(logs))
+        reused_logs = []
+        again = self.run_download(Session([]), progress=reused_logs.append)
+        self.assertEqual(again["totals"]["existing"], 1)
+        reused_lines = [line for line in reused_logs if line.startswith("[")]
+        self.assertEqual(reused_lines, ["[=]" + url + " | 已有本地文件（记录候选，未发起新请求）" for url in (original, fallback, unused)])
+        self.assertNotIn("HTTP 403", "\n".join(reused_logs))
+        self.assertFalse(any(line.startswith("[✓]") for line in reused_lines))
+
+    def test_live_url_log_marks_rejected_redirect_missing_url_and_sanitized_exception(self):
+        source = "https://p.douyinpic.com/redirect?sig=source%2Bfull"
+        destination = "https://unapproved.example.test/image?sig=redirect%2Ffull"
+        unavailable = "https://p.douyinpic.com/error?sig=known-full"
+        self.add("duoshan", [{"type": 27, "content": {"resource_url": {"url_list": [source]}}},
+                             {"type": 30, "content": {}},
+                             {"type": 27, "content": {"resource_url": {"url_list": [unavailable]}}}])
+        logs = []
+        session = Session([Response(status=302, headers={"Location": destination})])
+        get = session.get
+        def request(url, **options):
+            if url == unavailable:
+                raise OSError("secret-password from exception https://not-recorded.example.test/private")
+            return get(url, **options)
+        with patch.object(session, "get", side_effect=request):
+            result = self.run_download(session, progress=logs.append)
+        self.assertEqual(result["totals"], dict(downloaded=0, existing=0, failed=1, unsupported=2))
+        self.assertIn("[→]" + source + " | HTTP 302 重定向至 " + destination, logs)
+        denied = next(line for line in logs if line.startswith("[!]" + destination))
+        self.assertIn("不支持", denied)
+        self.assertIn("未发起请求", denied)
+        self.assertTrue(any(line.startswith("[!]无 URL | 不支持：") and "视频下载网址" in line for line in logs))
+        failed = next(line for line in logs if line.startswith("[x]" + unavailable))
+        self.assertIn("OSError", failed)
+        self.assertNotIn("secret-password", "\n".join(logs))
+        self.assertNotIn("not-recorded.example.test", "\n".join(logs))
+
+    def test_default_progress_with_strict_gbk_does_not_interrupt_download_or_change_signed_url(self):
+        url = "https://p.douyinpic.com/photo?signature=full%2Bexact%2Fvalue&x=1"
+        self.add("duoshan", [{"type": 27, "content": {"resource_url": {"url_list": [url]}}}])
+        buffer = io.BytesIO()
+        with io.TextIOWrapper(buffer, encoding="gbk", errors="strict") as stream:
+            with redirect_stdout(stream), patch.object(media, "_session", return_value=Session([Response(png_bytes())])):
+                result = media.download_library_media(self.library, self.work / "media", workers=1, download_media=True)
+            stream.flush()
+            text = buffer.getvalue().decode("gbk")
+        self.assertEqual(result["totals"]["downloaded"], 1)
+        self.assertEqual(result["patch_result"]["patched_messages"], 1)
+        self.assertIn("[+]" + url + " | 下载成功", text)
+        unicode_output = io.StringIO()
+        with redirect_stdout(unicode_output):
+            media._print_progress("[✓]" + url + " | 下载成功")
+        self.assertEqual(unicode_output.getvalue(), "[✓]" + url + " | 下载成功\n")
+
+    def test_custom_progress_encoding_exception_is_not_suppressed(self):
+        self.add("duoshan", [{"type": 30, "content": {}}])
+        error = UnicodeEncodeError("gbk", "✓", 0, 1, "synthetic callback error")
+        def progress(_):
+            raise error
+        with self.assertRaises(UnicodeEncodeError) as raised:
+            media.download_library_media(self.library, self.work / "media", progress=progress, download_media=True)
+        self.assertIs(raised.exception, error)
 
     def test_app_specific_extraction_preserves_signed_queries_and_ignores_chat_links(self):
         ds = media._extract_resources("duoshan", {"type": 27, "content": json.dumps({"resource_url": {"origin_url_list": ["https://p.douyinpic.com/a?sig=exact"], "thumb_url_list": ["https://p.douyinpic.com/thumb"]}})}, {}, 27)
@@ -223,7 +299,8 @@ class LibraryMediaTests(unittest.TestCase):
                 yield b"partial"
                 cancelled[0] = True
                 yield b"remaining"
-        result = self.run_download(Session([CancellingResponse(headers={})]), cancel=lambda: cancelled[0])
+        logs = []
+        result = self.run_download(Session([CancellingResponse(headers={})]), cancel=lambda: cancelled[0], progress=logs.append)
         self.assertEqual(result["status"], "cancelled")
         report = media.inspect_library_media(self.library, progress=lambda _: None)
         row = report["resources"][0]
@@ -234,6 +311,7 @@ class LibraryMediaTests(unittest.TestCase):
         self.assertEqual(row["attempted_urls"], [url])
         self.assertEqual(row["attempts"][0]["status"], "cancelled")
         self.assertFalse(result["patch_result"])
+        self.assertTrue(any(line.startswith("[!]" + url + " | 已取消：") for line in logs))
 
     def test_opt_in_required_before_any_artifact_or_network(self):
         session = Session([])
@@ -505,12 +583,18 @@ class LibraryMediaTests(unittest.TestCase):
                 raise OSError("synthetic worker failure with private URL")
             return actual(item, *args)
         session = Session([Response(png_bytes(color=(20 + i, 30, 40))) for i in range(11)])
+        coordinator = threading.get_ident()
+        callbacks = []
         with patch.object(media, "_session", return_value=session), patch.object(media, "_download", side_effect=one_worker_fails):
-            result = media.download_library_media(self.library, self.work / "media", workers=6, progress=lambda _: None, download_media=True)
+            result = media.download_library_media(self.library, self.work / "media", workers=6,
+                progress=lambda line: callbacks.append((threading.get_ident(), line)), download_media=True)
         self.assertEqual(result["totals"], dict(downloaded=11, existing=0, failed=1, unsupported=0))
         self.assertEqual(result["patch_result"]["patched_messages"], 11)
         self.assertEqual(len([r for r in media._load_manifest(self.library).values() if r["status"] == "ok"]), 11)
         self.assertEqual(result["failures"][0]["reason"], "worker_OSError")
+        self.assertTrue(all(thread == coordinator for thread, _ in callbacks))
+        self.assertEqual(sum(line.startswith("[✓]") for _, line in callbacks), 11)
+        self.assertNotIn("synthetic worker failure with private URL", "\n".join(line for _, line in callbacks))
         self.assertFalse(list((self.library / "attachments").rglob("*.partial")))
         resumed = self.run_download(Session([Response(png_bytes(color=(90, 50, 10)))]))
         self.assertEqual(resumed["totals"], dict(downloaded=1, existing=11, failed=0, unsupported=0))
@@ -553,7 +637,8 @@ class LibraryMediaTests(unittest.TestCase):
         self.assertIn(diagnostic["message"], logs)
         self.assertIn("媒体路径校验失败", diagnostic["message"])
         self.assertNotIn("private details", json.dumps(result) + "".join(logs))
-        self.assertNotIn("token=private", "".join(logs))
+        self.assertTrue(any(line.startswith("[x]https://p.douyinpic.com/a?token=private |")
+                            and "未发起请求" in line for line in logs))
         journal_failure = next(r for r in media._load_manifest(self.library).values() if r["status"] == "failed")
         self.assertEqual(journal_failure["diagnostic"], diagnostic)
 

@@ -182,3 +182,8 @@ queries, unknown historical attempts and lock-free reads beside an active
 mutation lock. Mock responses verify HTTP 403, invalid image bytes, unsupported
 hosts and rejected redirect destinations. Success patches must exclude all URL
 diagnostics. Reports are HTML-escaped local text with no remote links/content.
+Direct download-log checks cover full signed URLs, failed-then-successful
+fallbacks, rejected redirects, absent URLs, cancellation and cached reuse
+without replaying historical outcomes. Six-worker checks keep progress callbacks
+on the coordinating thread. Qt verifies URL lines appear before completion as
+plain text while compact status labels retain aggregate progress.

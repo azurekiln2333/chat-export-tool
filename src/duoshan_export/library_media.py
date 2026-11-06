@@ -16,6 +16,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from urllib.parse import urljoin, urlsplit
@@ -113,6 +114,67 @@ def _resource_details(item, record, *, attempts_known=None):
             "attempted_urls": list(dict.fromkeys(request["url"] for attempt in attempts for request in attempt.get("requests", [])
                                                 if request.get("requested") and request.get("url"))),
             "reason_text": reason_text(reason), "messages": _message_refs(item) if "messages" in item else record.get("messages", [])}
+
+
+def _log_resource_urls(progress, item, record, *, existing=False):
+    """Emit local full-URL outcomes only from the coordinating download thread."""
+    urls = item.get("urls") or []
+    if existing:
+        for url in urls or ["无 URL"]:
+            progress(f"[=]{url} | 已有本地文件（记录候选，未发起新请求）")
+        return
+
+    def outcome(url, status, reason, note=""):
+        marker = {"ok": "✓", "failed": "x", "unsupported": "!", "cancelled": "!"}.get(status, "x")
+        label = STATUS_TEXT.get(status, "失败")
+        detail = label if status == "ok" else label + "：" + reason_text(reason)
+        progress(f"[{marker}]{url} | {detail}{note}")
+
+    attempts = record.get("attempts") or []
+    for attempt in attempts:
+        requests = attempt.get("requests") or []
+        final_logged = False
+        for request in requests:
+            url = request["url"]
+            if request.get("status") == "redirect":
+                progress(f"[→]{url} | HTTP {request.get('http_status', '')} 重定向至 {request.get('redirect_to', '')}")
+                continue
+            if request.get("status") in {"checking", "received"}:
+                status, reason = attempt.get("status", "failed"), attempt.get("reason", record.get("reason"))
+            else:
+                status, reason = request.get("status", "failed"), request.get("reason", attempt.get("reason"))
+            note = "（未发起请求）" if not request.get("requested") else ""
+            outcome(url, status, reason, note)
+            final_logged = True
+        if not final_logged:
+            url = requests[-1]["url"] if requests else attempt.get("recorded_url", "无 URL")
+            outcome(url, attempt.get("status", "failed"), attempt.get("reason", record.get("reason")),
+                    "" if requests else "（未发起请求）")
+    if attempts:
+        return
+    status = record.get("status", "failed")
+    note = "（记录候选，未发起请求）" if record.get("attempts_known") else "（记录候选，请求详情未知）"
+    for url in urls or ["无 URL"]:
+        reference = ""
+        if not urls and item.get("messages"):
+            message = item["messages"][0]
+            reference = f" | 账号 {message['uid']} · 消息 {message['msg_uuid']}"
+        outcome(url, status, record.get("reason"), (note if urls else "") + reference)
+
+
+def _print_progress(value):
+    """Keep default CLI progress usable with Windows legacy redirected streams."""
+    try:
+        print(value)
+    except UnicodeEncodeError:
+        text = str(value)
+        for marker, replacement in (("[✓]", "[+]"), ("[→]", "[>]")):
+            if text.startswith(marker):
+                text = replacement + text[len(marker):]
+                break
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        # ASCII signed URLs remain exact; other unencodable text is reversible.
+        print(text.encode(encoding, errors="backslashreplace").decode(encoding))
 
 
 class _Cancelled(Exception):
@@ -838,6 +900,8 @@ def _patch(output, updates, node, progress):
 def download_library_media(output, work, *, accounts=None, progress=print, cancel=None,
                            node="node", workers=6, download_media=False):
     """Download recorded media only after explicit opt-in; return durable totals."""
+    if progress is print:
+        progress = _print_progress
     if download_media is not True:
         raise ExportError("Online media retrieval requires explicit download_media=True / --download-media.")
     if not isinstance(workers, int) or not 1 <= workers <= 16:
@@ -879,6 +943,7 @@ def download_library_media(output, work, *, accounts=None, progress=print, cance
             # individually; failed discovery can be reproduced on the next run.
             if not existing:
                 _journal(output, record, durable=record["status"] == "ok")
+            _log_resource_urls(progress, item, record, existing=existing)
             if record["status"] == "ok":
                 totals["existing" if existing else "downloaded"] += 1
                 wanted_paths = [record["path"], *[r["path"] for r in record.get("originals", [])]]
@@ -973,6 +1038,7 @@ def download_library_media(output, work, *, accounts=None, progress=print, cance
                                       "attempts_known": hasattr(error, "attempts")}
                             record.update(_resource_details(item, record))
                             _journal(output, record)
+                            _log_resource_urls(progress, item, record)
                         except Exception as error:
                             completed(item, {"status": "failed", "reason": "worker_" + type(error).__name__, "attempts_known": False})
                     if not cancelled:
