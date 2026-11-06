@@ -1,5 +1,9 @@
 # Command reference
 
+For WeChat, Duoshan and Xiaohongshu in one updatable reader library, see
+[Unified import](unified-import.md). The commands below retain the legacy
+single-app export workflow; use `import` to merge separate or newer backups.
+
 Every command is available as `python -m duoshan_export <command>` or through
 the installed `duoshan-export` console script. `run.ps1` forwards to
 `python -m duoshan_export`.

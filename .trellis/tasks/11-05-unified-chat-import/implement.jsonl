@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/export-contract.md", "reason": "Required adapter/library/reader contract"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "Required adapter/library/reader contract"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Required adapter/library/reader contract"}
+{"file": ".trellis/spec/backend/web-reader.md", "reason": "Required adapter/library/reader contract"}
+{"file": ".trellis/spec/frontend/quality-guidelines.md", "reason": "Required adapter/library/reader contract"}

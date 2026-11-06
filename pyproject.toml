@@ -19,10 +19,14 @@ dependencies = [
 encrypted = ["sqlcipher3-wheels>=0.5.7"]
 heif = ["pillow-heif>=0.18"]
 xhs = ["cryptography>=42.0"]
+gui = ["PyQt6>=6.7", "PyQt6-Fluent-Widgets>=1.7"]
 full = ["sqlcipher3-wheels>=0.5.7", "pillow-heif>=0.18", "cryptography>=42.0"]
 
 [project.scripts]
 duoshan-export = "duoshan_export.cli:main"
+
+[project.gui-scripts]
+chat-archive = "duoshan_export.gui:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
