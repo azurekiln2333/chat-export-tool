@@ -39,6 +39,80 @@ MAX_REDIRECTS = 4
 MAX_CANDIDATES = 8
 _SESSION = threading.local()
 _PUBLISH_LOCK = threading.Lock()
+MEDIA_FIELDS = {"status", "kind", "path", "sha256", "bytes", "format", "width", "height", "frames", "duration", "mime"}
+STATUS_TEXT = {"ok": "下载成功", "existing": "已有本地文件", "failed": "失败", "unsupported": "不支持",
+               "pending": "待处理 / 暂无结果", "orphaned": "当前记录已不存在", "cancelled": "已取消"}
+REASON_TEXT = {
+    "missing_recorded_url": "备份没有记录可用的媒体网址，无法发起下载。",
+    "video_url_not_recorded": "备份没有记录视频下载网址；封面图片有独立网址时可单独下载。",
+    "wechat_url_not_recorded": "微信备份没有记录可直接下载的 HTTP(S) 媒体网址。",
+    "encrypted_wechat_resource": "微信资源包含加密密钥或专用 CDN 标记，当前下载器不支持此协议。",
+    "encrypted_media_resource": "媒体被标记为加密资源，当前下载器不支持直接获取。",
+    "unapproved_media_host": "网址或重定向目标不在该应用的已支持媒体域名范围内，工具未向该目标发出请求；这不代表文件不存在。",
+    "invalid_or_encrypted_image": "收到的内容无法通过图片解码校验，可能是非图片响应、加密内容或损坏文件。",
+    "invalid_or_encrypted_media": "收到的内容未通过媒体解码校验，可能是加密、损坏或非媒体响应。",
+    "invalid_or_encrypted_audio": "语音内容未能解码为可播放音频。",
+    "resource_exceeds_size_limit": "资源大小超过当前类型的下载上限。",
+    "incomplete_response": "下载字节数与服务端声明不符，已保留收到的部分文件。",
+    "empty_resource": "服务端返回了空文件。",
+    "invalid_content_length": "服务端返回的文件大小无效。",
+    "redirect_without_location": "服务端要求重定向，但没有提供目标网址。",
+    "too_many_redirects": "重定向次数超过限制。",
+    "unsupported_video_container": "视频封装格式暂不支持。",
+    "unsupported_attachment_format": "附件格式暂不支持自动保存。",
+    "missing_audio_stream": "文件中没有可识别的音轨。",
+    "missing_video_stream": "文件中没有可识别的视频轨道。",
+    "existing_content_hash_mismatch": "同名本地文件的内容哈希不匹配，未覆盖原文件。",
+    "copy_hash_mismatch": "复制后的内容哈希不匹配，未发布文件。",
+    "media_path_validation_failed": "媒体目标路径未通过资料库目录范围校验。",
+    "invalid_media_staging_directory": "媒体暂存目录不存在或未通过路径校验。",
+    "downloaded": "已下载并通过媒体校验。",
+    "pending_result": "此快照没有该资源的完成结果；它可能尚未开始、正在处理，或此前任务已中断。",
+    "local_media_reference_present": "当前消息已关联本地文件；本报告只检查文件存在，未重新解码或校验哈希。",
+    "message_no_longer_present": "日志仍保留此资源，但当前资料库已没有对应消息。",
+    "historical_attempts_unknown": "旧版日志没有保存尝试过的网址，不能据此推断哪些候选网址实际请求过。",
+    "cancelled": "操作已取消；已收到的部分文件和此前成功结果会保留。",
+}
+
+
+def reason_text(reason):
+    """Translate stable reason codes without guessing a remote server's cause."""
+    parts = str(reason or "pending_result").split("; ")
+    translated = []
+    for part in parts:
+        if part in REASON_TEXT:
+            translated.append(REASON_TEXT[part])
+        elif part.startswith(("expired_or_unavailable_http_", "http_")):
+            code = part.rsplit("_", 1)[-1]
+            translated.append({"403": "服务器返回 HTTP 403，拒绝访问；可能涉及签名、权限或服务端限制，单凭状态码无法确定原因。",
+                               "401": "服务器返回 HTTP 401，要求有效授权。",
+                               "404": "服务器返回 HTTP 404，当前网址未找到资源。",
+                               "410": "服务器返回 HTTP 410，资源已不可用。"}.get(code, f"服务器返回 HTTP {code}，下载未完成。"))
+        elif part.startswith("media_staging_"):
+            translated.append("媒体暂存目录创建或校验失败，尚未开始此次下载。")
+        elif part.startswith("worker_"):
+            translated.append("此资源处理发生异常，其他资源继续处理。错误类型：" + part[7:])
+        elif part.startswith("media_decoder_"):
+            translated.append("媒体解码程序未能完成。错误类型：" + part[14:])
+        else:
+            translated.append("处理未完成，原因代码：" + part)
+    return " ".join(dict.fromkeys(translated))
+
+
+def _message_refs(item):
+    return [{k: message[k] for k in ("uid", "msg_uuid", "conversation_id", "conversation_name", "account_directory") if k in message}
+            for message in item.get("messages", [])]
+
+
+def _resource_details(item, record, *, attempts_known=None):
+    attempts = record.get("attempts") if isinstance(record.get("attempts"), list) else []
+    known = record.get("attempts_known", "attempts" in record) if attempts_known is None else attempts_known
+    reason = record.get("reason") or ("downloaded" if record.get("status") == "ok" else "pending_result")
+    return {"recorded_urls": list(item.get("urls", record.get("recorded_urls", []))),
+            "attempts": attempts, "attempts_known": bool(known),
+            "attempted_urls": list(dict.fromkeys(request["url"] for attempt in attempts for request in attempt.get("requests", [])
+                                                if request.get("requested") and request.get("url"))),
+            "reason_text": reason_text(reason), "messages": _message_refs(item) if "messages" in item else record.get("messages", [])}
 
 
 class _Cancelled(Exception):
@@ -212,21 +286,29 @@ def _session():
     return session
 
 
-def _fetch(app, url, kind, run, cancel):
+def _fetch(app, url, kind, run, cancel, requests=None):
     """Stream bounded responses, validating the first URL and every redirect."""
     if url.startswith("http://"):
         url = "https://" + url[7:]
     for _ in range(MAX_REDIRECTS + 1):
         _check(cancel)
+        request = {"url": url, "requested": False, "status": "checking"}
+        if requests is not None:
+            requests.append(request)
         if not _allowed(app, url):
+            request.update(status="unsupported", reason="unapproved_media_host", reason_text=reason_text("unapproved_media_host"))
             raise _ResourceError("unapproved_media_host", "unsupported")
-        response = _session().get(url, timeout=(8, 30), allow_redirects=False, stream=True)
+        request["requested"] = True
+        response = None
         try:
+            response = _session().get(url, timeout=(8, 30), allow_redirects=False, stream=True)
+            request["http_status"] = response.status_code
             if response.status_code in (301, 302, 303, 307, 308):
                 location = response.headers.get("Location")
                 if not location:
                     raise _ResourceError("redirect_without_location")
                 url = urljoin(url, location)
+                request.update(status="redirect", redirect_to=url)
                 continue
             if response.status_code in (401, 403, 404, 410):
                 raise _ResourceError("expired_or_unavailable_http_" + str(response.status_code))
@@ -256,9 +338,20 @@ def _fetch(app, url, kind, run, cancel):
                 raise _ResourceError("empty_resource")
             if length and not response.headers.get("Content-Encoding") and length != size:
                 raise _ResourceError("incomplete_response")
+            request["status"] = "received"
             return target, response.headers.get("Content-Type", "")
+        except _ResourceError as error:
+            request.update(status=error.status, reason=error.reason, reason_text=reason_text(error.reason))
+            raise
+        except _Cancelled:
+            request.update(status="cancelled", reason="cancelled")
+            raise
+        except Exception as error:
+            request.update(status="failed", reason=type(error).__name__, reason_text=reason_text(type(error).__name__))
+            raise
         finally:
-            response.close()
+            if response is not None:
+                response.close()
     raise _ResourceError("too_many_redirects")
 
 
@@ -478,7 +571,11 @@ def _inventory(output, accounts, progress, cancel):
     scanned, last_progress = 0, time.monotonic()
     database = sqlite3.connect((output / "reader.sqlite").as_uri() + "?mode=ro", uri=True)
     try:
-        account_apps = dict(database.execute("SELECT uid,app FROM library_accounts"))
+        database.execute("PRAGMA query_only=ON")
+        database.execute("BEGIN")
+        account_rows = list(database.execute("SELECT uid,app,directory FROM library_accounts"))
+        account_apps = {uid: app for uid, app, _ in account_rows}
+        account_directories = {uid: directory for uid, _, directory in account_rows}
         wanted = set(str(uid) for uid in (accounts or account_apps))
         unknown = wanted - account_apps.keys()
         if unknown:
@@ -486,7 +583,7 @@ def _inventory(output, accounts, progress, cancel):
         for uid in sorted(wanted):
             app = account_apps[uid]
             progress("识别资料库媒体：" + app)
-            for index, (uuid, raw_text, meta_text, typ) in enumerate(database.execute("SELECT msg_uuid,raw_json,meta_json,message_type FROM messages WHERE uid=?", (uid,))):
+            for index, (uuid, raw_text, meta_text, typ, conversation_id, conversation_name) in enumerate(database.execute("SELECT msg_uuid,raw_json,meta_json,message_type,conversation_id,conversation_name FROM messages WHERE uid=?", (uid,))):
                 if index % 1000 == 0:
                     _check(cancel)
                 raw, meta = json.loads(raw_text), json.loads(meta_text)
@@ -507,6 +604,8 @@ def _inventory(output, accounts, progress, cancel):
                         if candidate not in group["existing_candidates"]:
                             group["existing_candidates"].append(candidate)
                     group["messages"].append({"uid": uid, "msg_uuid": uuid, "app": app,
+                        "conversation_id": conversation_id, "conversation_name": conversation_name,
+                        "account_directory": account_directories[uid],
                         "expected_raw_sha256": hashlib.sha256(raw_text.encode()).hexdigest(),
                         "present_paths": list(dict.fromkeys([*local, *meta.get("original_media", []), *([primary["path"]] if primary.get("path") else [])]))})
     except sqlite3.Error as error:
@@ -516,10 +615,173 @@ def _inventory(output, accounts, progress, cancel):
     return resources
 
 
+def _manifest_snapshot(output, cancel=None):
+    """Read only the bytes present at open; a concurrent append is a later snapshot."""
+    records = {}
+    snapshot = {"bytes": 0, "parsed_records": 0, "ignored_lines": 0, "torn_final_line": False}
+    path = output / MANIFEST
+    try:
+        stream = path.open("rb")
+    except FileNotFoundError:
+        return records, snapshot
+    with stream:
+        remaining = snapshot["bytes"] = os.fstat(stream.fileno()).st_size
+        while remaining:
+            _check(cancel)
+            line = stream.readline(min(remaining, 8 * 1024**2 + 1))
+            if not line:
+                break
+            remaining -= len(line)
+            if len(line) > 8 * 1024**2:
+                # Bound malformed single-line allocation without following appends.
+                while remaining and not line.endswith(b"\n"):
+                    line = stream.readline(min(remaining, 64 * 1024))
+                    if not line:
+                        break
+                    remaining -= len(line)
+                snapshot["ignored_lines"] += 1
+                continue
+            if not line.endswith(b"\n"):
+                snapshot["torn_final_line"] = True
+                snapshot["ignored_lines"] += 1
+                continue
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except (ValueError, UnicodeError):
+                snapshot["ignored_lines"] += 1
+                continue
+            if isinstance(record, dict) and isinstance(record.get("resource_id"), str):
+                records[record["resource_id"]] = record
+                snapshot["parsed_records"] += 1
+            else:
+                snapshot["ignored_lines"] += 1
+    snapshot["unique_resources"] = len(records)
+    return records, snapshot
+
+
+def _report_local_paths(item, output):
+    paths = []
+    extensions = {"voice": {".wav", ".mp3", ".m4a", ".ogg", ".flac"},
+                  "image": {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif"},
+                  "emoji": {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif"},
+                  "video": {".mp4", ".webm", ".mov"}, "file": {".pdf", ".zip"}}
+    for candidate in item.get("existing_candidates", []):
+        primary = candidate.get("media") or {}
+        for relative in [*candidate.get("local_media", []), *([primary["path"]] if primary.get("path") else [])]:
+            try:
+                path = _contained_file(output, relative)
+                if path.suffix.lower() in extensions.get(item["kind"], set()) and path.is_file() and relative not in paths:
+                    paths.append(relative)
+            except (ExportError, OSError, TypeError):
+                continue
+    return paths
+
+
+def _write_media_report(result, output):
+    folder = output / "media_reports"
+    if folder.is_symlink() or not folder.resolve().is_relative_to(output):
+        raise ExportError("Report directory escapes its library.")
+    folder.mkdir(exist_ok=True)
+    if folder.is_symlink() or not folder.resolve().is_relative_to(output):
+        raise ExportError("Report directory escapes its library.")
+    name = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:12]
+    paths = {key: folder / (name + suffix) for key, suffix in
+             (("report_json", ".json"), ("report_html", ".html"), ("report_text", ".txt"))}
+    result.update({key: str(path) for key, path in paths.items()})
+    with paths["report_json"].open("x", encoding="utf-8", newline="\n") as stream:
+        json.dump(result, stream, ensure_ascii=False, indent=2)
+    with paths["report_html"].open("x", encoding="utf-8", newline="\n") as page, paths["report_text"].open("x", encoding="utf-8", newline="\n") as plain:
+        page.write('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'"><meta name="viewport" content="width=device-width"><title>媒体下载详情</title>'
+                   '<style>body{font:16px system-ui,sans-serif;max-width:1150px;margin:32px auto;padding:0 20px;color:#253044}details{border:1px solid #cbd5e1;border-radius:8px;padding:14px;margin:12px 0}summary{cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f5f7fa;padding:12px}p{line-height:1.6}</style>'
+                   '<h1>媒体下载详情</h1>')
+        heading = f"快照时间：{result['as_of']}\n{result['snapshot_note']}\n统计：{json.dumps(result['totals'], ensure_ascii=False)}"
+        page.write("<pre>" + html.escape(heading) + "</pre><p>不支持表示备份或当前工具无法发起/完成此类获取，并不等于文件不存在。完整网址仅作为可选择的文本展示，不会自动打开。</p>")
+        plain.write("媒体下载详情\n" + heading + "\n\n")
+        for item in result["resources"]:
+            title = f"{item['status_text']} · {item['app']} · {item['kind']} · {item['resource_id']}"
+            sections = [title, item["reason_text"], "消息引用：" + json.dumps(item["messages"], ensure_ascii=False),
+                        "备份记录的网址：\n" + ("\n".join(item["recorded_urls"]) or "没有记录可用网址"),
+                        "实际请求的网址：\n" + ("\n".join(item["attempted_urls"]) if item["attempts_known"] and item["attempted_urls"] else
+                                               "未发出网络请求" if item["attempts_known"] else REASON_TEXT["historical_attempts_unknown"]),
+                        "逐次尝试详情：\n" + json.dumps(item["attempts"], ensure_ascii=False, indent=2)]
+            if item.get("diagnostic"):
+                sections.append("路径诊断：\n" + json.dumps(item["diagnostic"], ensure_ascii=False, indent=2))
+            body = "\n\n".join(sections[1:])
+            page.write("<details><summary>" + html.escape(title) + "</summary><pre>" + html.escape(body) + "</pre></details>")
+            plain.write("\n\n".join(sections) + "\n\n")
+        page.write("</html>")
+
+
+def inspect_library_media(output, *, accounts=None, progress=print, cancel=None, active_download=None):
+    """Create a local offline report without taking the mutation lock or patching data."""
+    output = Path(output).expanduser().resolve()
+    from .library import PACKAGES
+    if any(part in PACKAGES for part in output.parts):
+        raise ExportError("Reports cannot be created inside original Android package folders.")
+    if not (output / "reader.sqlite").is_file():
+        raise ExportError("Choose an existing reader library containing reader.sqlite.")
+    started = datetime.now(timezone.utc).isoformat()
+    try:
+        known, snapshot = _manifest_snapshot(output, cancel)
+        inventory = _inventory(output, accounts, progress, cancel)
+        resources = []
+        totals = dict(ok=0, existing=0, failed=0, unsupported=0, pending=0, orphaned=0)
+        for item in inventory.values():
+            _check(cancel)
+            record = known.get(item["resource_id"], {})
+            paths = _report_local_paths(item, output)
+            if record:
+                status = record.get("status", "pending")
+                reason = record.get("reason") or ("downloaded" if status == "ok" else "pending_result")
+            elif paths:
+                status, reason = "existing", "local_media_reference_present"
+            elif item.get("reason"):
+                status, reason = "unsupported", item["reason"]
+            else:
+                status, reason = "pending", "pending_result"
+            if status not in totals:
+                status = "pending"
+            row = {"resource_id": item["resource_id"], "app": item["app"], "kind": item["kind"],
+                   "status": status, "status_text": STATUS_TEXT[status], "reason": reason,
+                   **_resource_details(item, {**record, "status": status, "reason": reason},
+                                       attempts_known=None if record else False),
+                   "current": True, "journal_time": record.get("time"), "local_paths": paths,
+                   "diagnostic": record.get("diagnostic"), "journal_status": record.get("status")}
+            resources.append(row)
+            totals[status] += 1
+        for rid, record in known.items():
+            if rid in inventory or (accounts and not any(m.get("uid") in accounts for m in record.get("messages", []))):
+                continue
+            resources.append({"resource_id": rid, "app": record.get("app", ""), "kind": record.get("kind", ""),
+                              "status": "orphaned", "status_text": STATUS_TEXT["orphaned"], "reason": "message_no_longer_present",
+                              **_resource_details({"messages": []}, {**record, "reason": "message_no_longer_present"}),
+                              "historical_messages": record.get("messages", []),
+                              "current": False, "journal_status": record.get("status"), "journal_time": record.get("time")})
+            totals["orphaned"] += 1
+        journal_path = output / MANIFEST
+        snapshot["bytes_after_inventory"] = journal_path.stat().st_size if journal_path.is_file() else 0
+        changed = snapshot["bytes_after_inventory"] != snapshot["bytes"]
+        active = bool(active_download) or changed
+        note = "正在下载期间生成的快照，后续结果会继续变化。" if active else "只读扫描时点的快照；本报告不代表某次下载任务已完成。"
+        note += " 日志固定到扫描开始时的字节数，消息来自当前 SQLite 只读快照；本报告不联网，不修改消息。"
+        result = {"status": "completed", "as_of": started, "completed_at": datetime.now(timezone.utc).isoformat(),
+                  "data_status": "active_snapshot" if active else "snapshot", "snapshot_note": note,
+                  "active_download": active_download, "journal_grew_during_scan": changed,
+                  "journal_snapshot": snapshot, "totals": totals, "resources": resources}
+        _check(cancel)
+        _write_media_report(result, output)
+        progress("媒体详情报告已生成：" + result["report_html"])
+        return result
+    except _Cancelled:
+        return {"status": "cancelled", "as_of": started, "resources": [], "totals": {}}
+
+
 def _download(item, output, run, node, cancel):
     if item.get("reason"):
-        return {"status": "unsupported", "reason": item["reason"]}
-    errors = []
+        return {"status": "unsupported", "reason": item["reason"], "attempts": [], "attempts_known": True}
+    errors, attempts = [], []
     try:
         incoming = Path(item["incoming"])
         checked = _media_path(output, incoming.relative_to(output).as_posix())
@@ -529,20 +791,30 @@ def _download(item, output, run, node, cancel):
         raise
     except Exception as error:
         return {"status": "failed", "reason": "media_staging_" + type(error).__name__,
+                "attempts": [], "attempts_known": True,
                 "diagnostic": _path_diagnostic(output, Path(item.get("incoming", run)), error)}
     for url in item["urls"][:MAX_CANDIDATES]:
+        attempt = {"recorded_url": url, "requests": []}
+        attempts.append(attempt)
         try:
-            path, mime = _fetch(item["app"], url, item["kind"], incoming, cancel)
-            return _prepare_asset(path, mime, item["kind"], output, item["app"], incoming, node, cancel)
-        except _Cancelled:
+            path, mime = _fetch(item["app"], url, item["kind"], incoming, cancel, attempt["requests"])
+            asset = _prepare_asset(path, mime, item["kind"], output, item["app"], incoming, node, cancel)
+            attempt.update(status="ok", reason="downloaded", reason_text=reason_text("downloaded"))
+            return {**asset, "attempts": attempts, "attempts_known": True}
+        except _Cancelled as error:
+            attempt.update(status="cancelled", reason="cancelled", reason_text=reason_text("cancelled"))
+            error.attempts = attempts
             raise
         except _ResourceError as error:
+            attempt.update(status=error.status, reason=error.reason, reason_text=reason_text(error.reason))
             errors.append((error.status, error.reason, error.diagnostic))
         except Exception as error:
             # Exceptions from requests/decoders can include signed URLs; never log them.
+            attempt.update(status="failed", reason=type(error).__name__, reason_text=reason_text(type(error).__name__))
             errors.append(("failed", type(error).__name__, None))
     result = {"status": "unsupported" if errors and all(s == "unsupported" for s, _, _ in errors) else "failed",
-              "reason": "; ".join(dict.fromkeys(reason for _, reason, _ in errors)) or "missing_recorded_url"}
+              "reason": "; ".join(dict.fromkeys(reason for _, reason, _ in errors)) or "missing_recorded_url",
+              "attempts": attempts, "attempts_known": True}
     diagnostic = next((details for _, _, details in errors if details), None)
     if diagnostic:
         result["diagnostic"] = diagnostic
@@ -597,10 +869,12 @@ def download_library_media(output, work, *, accounts=None, progress=print, cance
         progress(f"已识别 {len(inventory):,} 个媒体资源；开始校验已有文件。")
         pending_items = []
         reported_diagnostics = set()
+        reported_reasons = set()
         last_completion_progress = time.monotonic()
         def completed(item, record, existing=False):
             nonlocal last_completion_progress
             record = {"resource_id": item["resource_id"], "app": item["app"], "kind": item["kind"], **record}
+            record.update(_resource_details(item, record, attempts_known=None if existing else record.get("attempts_known", True)))
             # Existing live files need no recovery record. Downloads are fsynced
             # individually; failed discovery can be reproduced on the next run.
             if not existing:
@@ -613,6 +887,10 @@ def download_library_media(output, work, *, accounts=None, progress=print, cance
                     successful.append(({**item, "messages": patch_messages}, record))
             else:
                 totals["unsupported" if record["status"] == "unsupported" else "failed"] += 1
+                reason_key = (item["app"], record.get("reason", "failed"))
+                if reason_key not in reported_reasons:
+                    progress(f"媒体{STATUS_TEXT.get(record['status'], record['status'])}（{item['app']}）：{record['reason_text']}")
+                    reported_reasons.add(reason_key)
                 diagnostic = record.get("diagnostic") or {}
                 if diagnostic.get("message") and diagnostic["message"] not in reported_diagnostics:
                     progress(diagnostic["message"])
@@ -620,6 +898,7 @@ def download_library_media(output, work, *, accounts=None, progress=print, cance
                 failures.append({"resource_id": item["resource_id"], "app": item["app"], "status": record["status"],
                                  "reason": record.get("reason", "failed"), "account_uid": item["messages"][0]["uid"],
                                  "msg_uuid": item["messages"][0]["msg_uuid"],
+                                 **_resource_details(item, record),
                                  **({"diagnostic": record["diagnostic"]} if record.get("diagnostic") else {})})
             count = sum(totals.values())
             if time.monotonic() - last_completion_progress >= 2 or count == len(inventory):
@@ -686,18 +965,24 @@ def download_library_media(output, work, *, accounts=None, progress=print, cance
                         item = running.pop(future)
                         try:
                             completed(item, future.result())
-                        except _Cancelled:
+                        except _Cancelled as error:
                             cancelled = True
+                            attempts = getattr(error, "attempts", [])
+                            record = {"resource_id": item["resource_id"], "app": item["app"], "kind": item["kind"],
+                                      "status": "cancelled", "reason": "cancelled", "attempts": attempts,
+                                      "attempts_known": hasattr(error, "attempts")}
+                            record.update(_resource_details(item, record))
+                            _journal(output, record)
                         except Exception as error:
-                            completed(item, {"status": "failed", "reason": "worker_" + type(error).__name__})
+                            completed(item, {"status": "failed", "reason": "worker_" + type(error).__name__, "attempts_known": False})
                     if not cancelled:
                         submit()
         updates = run / "media-updates.jsonl"
         with updates.open("x", encoding="utf-8", newline="\n") as stream:
             for item, record in successful:
-                media = {k: v for k, v in record.items() if k not in {"originals", "time", "app", "resource_id"}}
+                media = {k: v for k, v in record.items() if k in MEDIA_FIELDS}
                 for message in item["messages"]:
-                    identity = {k: v for k, v in message.items() if k != "present_paths"}
+                    identity = {k: message[k] for k in ("uid", "msg_uuid", "app", "expected_raw_sha256")}
                     patch = {**identity, "local_media": [record["path"]], "original_media": [r["path"] for r in record.get("originals", [])],
                              "media": media, "media_status": "available"}
                     stream.write(json.dumps(patch, ensure_ascii=True) + "\n")

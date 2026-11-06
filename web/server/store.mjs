@@ -48,7 +48,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { DatabaseSync } from 'node:sqlite';
 import JSONbigFactory from 'json-bigint';
-import { accountDirectories, accountDirectory } from './account-layout.mjs';
+import { accountDirectories, accountDirectory, canonicalSourceApp } from './account-layout.mjs';
 
 const JSONbig = JSONbigFactory({ storeAsString: true, useNativeBigInt: false });
 
@@ -737,7 +737,7 @@ export class ChatStore {
     return { ...this.#counts(), imported: true, fingerprint };
   }
 
-  /** @returns {Array<{uid:string,name:string,message_count:number,conversation_count:number}>} */
+  /** @returns {Array<{uid:string,name:string,source_app:string,message_count:number,conversation_count:number}>} */
   listAccounts() {
     this.#assertOpen();
     const rows = this.#guard(() => this.#db.prepare(`
@@ -748,10 +748,32 @@ export class ChatStore {
              (SELECT COUNT(*) FROM conversations c WHERE c.uid = a.uid) AS conversation_count
       FROM accounts a
       ORDER BY a.uid ASC`).all());
+    // Managed libraries keep authoritative source identities in SQLite. Legacy
+    // exports can supply explicit directory/metadata labels without changing
+    // any stored IDs, messages or annotations. Never guess from UID shape.
+    const legacy = rows.some(row => !row.source_app)
+      ? new Map(accountDirectories(this.#outputDir).map(account => [account.uid, account]))
+      : new Map();
+    const summaryApp = canonicalSourceApp(this.appLabel());
+    let legacyMessage;
+    const sourceFor = row => {
+      if (row.source_app) return canonicalSourceApp(row.source_app);
+      const account = legacy.get(row.uid);
+      if (account?.app) return account.app;
+      const stats = account
+        ? readJsonFile(path.join(this.#outputDir, account.directory, STATISTICS_FILE)) : null;
+      const statsApp = canonicalSourceApp(stats?.app);
+      if (statsApp) return statsApp;
+      // The (uid,msg_uuid) primary key bounds this to one indexed account
+      // lookup. Older mixed libraries may only retain _export.app in raw data.
+      legacyMessage ??= this.#db.prepare('SELECT raw_json FROM messages WHERE uid=? LIMIT 1');
+      const raw = this.#guard(() => legacyMessage.get(row.uid));
+      return canonicalSourceApp(parseJsonLossless(raw?.raw_json)?._export?.app) || summaryApp;
+    };
     return rows.map((row) => ({
       uid: row.uid,
       name: row.name || row.uid,
-      source_app: row.source_app || '',
+      source_app: sourceFor(row),
       message_count: asInteger(row.message_count) ?? 0,
       conversation_count: asInteger(row.conversation_count) ?? 0,
     }));

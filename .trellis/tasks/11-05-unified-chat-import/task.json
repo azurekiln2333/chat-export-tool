@@ -21,6 +21,8 @@
   "children": [],
   "parent": null,
   "relatedFiles": [],
-  "notes": "Implementation and review verified 2026-11-07: neutral title, explicit post-import media, live metadata preservation and reported staging-error isolation. Python177+GUI6+Node159 passed; fullPython4 optionalQt skips covered separately. Exact original intermittent path failure not reproduced. User approved commits and push to origin/master on 2026-11-07. Implementation and verification complete; no automatic live download retry.",
-  "meta": {}
+  "notes": "Verified 2026-11-07: incremental three-app import and post-import media; local full-URL diagnostics with unknown historical attempts; library picker and owned-reader reload; desktop/web source labels; directory card removal. User authorized commits and push to origin/master. Original data and running GUI/downloads untouched. Read-only emoji diagnosis found resource-specific HTTP403 and confirmed successful resources in local reader HTTP/model. Cross-layer checks passed; detailed evidence in verification.md.",
+  "meta": {
+    "retained_in_place": "Workspace no-permanent-deletion rule: retain task and runtime evidence; do not invoke archive/finish deletion paths."
+  }
 }

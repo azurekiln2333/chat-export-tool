@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
+import { DatabaseSync } from 'node:sqlite';
 
 import {
   ACCOUNT_A, ACCOUNT_B, CONVERSATION_A, UUID, BIG_SERVER_ID, BIG_INDEX,
@@ -86,6 +87,45 @@ test('imports the synthetic export with account and conversation counts', async 
   assert.equal(conversations.items.length, 1);
   assert.equal(String(conversations.items[0].id), CONVERSATION_A);
   assert.equal(conversations.items[0].message_count, ACCOUNT_A_MESSAGES);
+});
+
+test('account sources prefer managed identity and explicit legacy metadata without guessing UID shape', async t => {
+  const { fixture, store } = await open(t);
+  const sources = () => Object.fromEntries(store.listAccounts().map(account => [account.uid, account.source_app]));
+  const before = hashExport(fixture.dir);
+  assert.deepEqual(sources(), { [ACCOUNT_A]: 'duoshan', [ACCOUNT_B]: 'duoshan' });
+  assert.deepEqual(hashExport(fixture.dir), before, 'listing sources never changes exported files');
+
+  fs.writeFileSync(path.join(fixture.dir, 'export_summary.json'), JSON.stringify({ app: 'Duoshan + Xiaohongshu' }));
+  fs.writeFileSync(path.join(fixture.dir, ACCOUNT_A, 'statistics.json'), JSON.stringify({ app: 'WeChat' }));
+  assert.deepEqual(sources(), { [ACCOUNT_A]: 'wechat', [ACCOUNT_B]: '' }, 'mixed summary and numeric UID cannot determine a source');
+
+  const legacyDb = new DatabaseSync(store.databasePath);
+  let rawBefore;
+  try {
+    legacyDb.prepare("UPDATE messages SET raw_json=json_set(raw_json,'$._export.app','Xiaohongshu') WHERE uid=?")
+      .run(ACCOUNT_B);
+    rawBefore = legacyDb.prepare('SELECT uid,msg_uuid,raw_json FROM messages ORDER BY uid,msg_uuid').all();
+  } finally { legacyDb.close(); }
+  assert.deepEqual(sources(), { [ACCOUNT_A]: 'wechat', [ACCOUNT_B]: 'xhs' },
+    'an unprefixed mixed legacy account can identify its source from stored export metadata');
+
+  fs.renameSync(path.join(fixture.dir, ACCOUNT_A), path.join(fixture.dir, 'xhs_' + ACCOUNT_A));
+  assert.equal(sources()[ACCOUNT_A], 'xhs', 'explicit prefix works for legacy exports');
+  const db = new DatabaseSync(store.databasePath);
+  try {
+    db.prepare('INSERT INTO library_accounts(uid,app,directory) VALUES(?,?,?)')
+      .run(ACCOUNT_A, 'wechat', 'xhs_' + ACCOUNT_A);
+    db.prepare('INSERT INTO library_accounts(uid,app,directory) VALUES(?,?,?)')
+      .run(ACCOUNT_B, 'future-app', ACCOUNT_B);
+  } finally { db.close(); }
+  fs.writeFileSync(path.join(fixture.dir, 'export_summary.json'), JSON.stringify({ app: 'Duoshan' }));
+  assert.deepEqual(sources(), { [ACCOUNT_A]: 'wechat', [ACCOUNT_B]: '' }, 'registry overrides folder and summary, including unknown future apps');
+  const verifyDb = new DatabaseSync(store.databasePath);
+  try {
+    assert.deepEqual(verifyDb.prepare('SELECT uid,msg_uuid,raw_json FROM messages ORDER BY uid,msg_uuid').all(), rawBefore,
+      'source fallback never rewrites stored original messages');
+  } finally { verifyDb.close(); }
 });
 
 test('raw_json preserves integers beyond 2^53 exactly', async (t) => {

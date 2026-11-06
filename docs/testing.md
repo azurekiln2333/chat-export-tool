@@ -176,3 +176,9 @@ and attach when another fails, and that retry handles only the failed resource.
 Path rejection tests verify local diagnostics and isolation between apps. SILK
 decoder output must not undergo a redundant WAV conversion; image conversion
 must close its source before atomic publication on Windows.
+Offline report tests cover bounded journal snapshots during appends, repeated
+resource entries, torn lines, current/deleted message references, complete signed
+queries, unknown historical attempts and lock-free reads beside an active
+mutation lock. Mock responses verify HTTP 403, invalid image bytes, unsupported
+hosts and rejected redirect destinations. Success patches must exclude all URL
+diagnostics. Reports are HTML-escaped local text with no remote links/content.

@@ -82,6 +82,159 @@ class LibraryMediaTests(unittest.TestCase):
         video = media._extract_resources("duoshan", {"type": 30, "content": {"poster": {"origin_url_list": ["https://p.byteimg.com/poster"]}}}, {}, 30)
         self.assertEqual([(item["kind"], item["reason"]) for item in video], [("video", "video_url_not_recorded"), ("image", None)])
 
+    def test_offline_report_uses_latest_bounded_journal_and_current_inventory_without_mutation(self):
+        url = "https://p.douyinpic.com/photo?sig=full%2Bvalue&x=<tag>"
+        self.add("duoshan", [{"type": 27, "content": {"resource_url": {"url_list": [url]}}},
+                             {"type": 30, "content": {}},
+                             {"type": 27, "content": {"resource_url": {"url_list": ["https://p.douyinpic.com/pending"]}}}])
+        inventory = media._inventory(self.library, None, lambda _: None, None)
+        item = next(r for r in inventory.values() if url in r["urls"])
+        media._journal(self.library, {"resource_id": item["resource_id"], "app": "duoshan", "kind": "image", "status": "unsupported", "reason": "unapproved_media_host"})
+        media._journal(self.library, {"resource_id": item["resource_id"], "app": "duoshan", "kind": "image", "status": "failed", "reason": "expired_or_unavailable_http_403"})
+        with (self.library / media.MANIFEST).open("ab") as stream:
+            stream.write(b'{"resource_id":"torn')
+        before = (self.library / "reader.sqlite").read_bytes()
+        with patch.object(media, "_session", side_effect=AssertionError("report must stay offline")), \
+             patch.object(media, "_patch", side_effect=AssertionError("report must not mutate reader")), \
+             patch.object(media, "_library_lock", side_effect=AssertionError("report must not lock downloader")):
+            result = media.inspect_library_media(self.library, active_download=True, progress=lambda _: None)
+            again = media.inspect_library_media(self.library, progress=lambda _: None)
+        self.assertEqual(before, (self.library / "reader.sqlite").read_bytes())
+        self.assertEqual(result["data_status"], "active_snapshot")
+        self.assertEqual(result["totals"], dict(ok=0, existing=0, failed=1, unsupported=1, pending=1, orphaned=0))
+        self.assertTrue(all(not row["attempts_known"] for row in result["resources"]))
+        row = next(r for r in result["resources"] if r["resource_id"] == item["resource_id"])
+        self.assertEqual(row["recorded_urls"], [url])
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("403", row["reason_text"])
+        self.assertFalse(row["attempts_known"])
+        self.assertEqual(row["attempted_urls"], [])
+        self.assertTrue(row["messages"][0]["account_directory"].startswith("dy_"))
+        self.assertTrue(result["journal_snapshot"]["torn_final_line"])
+        self.assertEqual(result["journal_snapshot"]["parsed_records"], 2)
+        self.assertNotEqual(result["report_json"], again["report_json"])
+        self.assertIn(url, Path(result["report_text"]).read_text(encoding="utf-8"))
+        html_report = Path(result["report_html"]).read_text(encoding="utf-8")
+        self.assertNotIn("<tag>", html_report)
+        self.assertIn("&lt;tag&gt;", html_report)
+        self.assertNotIn('<a href="https:', html_report)
+        self.assertEqual(json.loads(Path(result["report_json"]).read_text(encoding="utf-8"))["resources"], result["resources"])
+
+    def test_recorded_and_attempted_urls_include_rejected_redirect_and_chinese_causes(self):
+        urls = ["https://p.douyinpic.com/forbidden?sig=full%2Btoken&x=1", "https://unapproved.example.test/image?private=recorded",
+                "https://p.douyinpic.com/redirect?sig=old", "https://p.douyinpic.com/bad-image?sig=bad"]
+        redirect = "https://127.0.0.1/blocked?sig=redirect%2Btoken"
+        self.add("duoshan", [{"type": 27, "content": {"resource_url": {"url_list": [url]}}} for url in urls] + [{"type": 30, "content": {}}])
+        session = Session([Response(status=403), Response(status=302, headers={"Location": redirect}), Response(b"not an image")])
+        result = self.run_download(session)
+        self.assertEqual(result["totals"], dict(downloaded=0, existing=0, failed=2, unsupported=3))
+        rows = {item["recorded_urls"][0]: item for item in result["failures"] if item["recorded_urls"]}
+        self.assertEqual(rows[urls[0]]["attempted_urls"], [urls[0]])
+        self.assertEqual(rows[urls[0]]["attempts"][0]["requests"][0]["http_status"], 403)
+        self.assertIn("拒绝访问", rows[urls[0]]["reason_text"])
+        self.assertEqual(rows[urls[1]]["attempted_urls"], [])
+        self.assertFalse(rows[urls[1]]["attempts"][0]["requests"][0]["requested"])
+        self.assertIn("不代表文件不存在", rows[urls[1]]["reason_text"])
+        redirected = rows[urls[2]]
+        self.assertEqual(redirected["attempted_urls"], [urls[2]])
+        self.assertEqual(redirected["attempts"][0]["requests"][0]["redirect_to"], redirect)
+        self.assertEqual(redirected["attempts"][0]["requests"][1]["url"], redirect)
+        self.assertFalse(redirected["attempts"][0]["requests"][1]["requested"])
+        self.assertEqual(rows[urls[3]]["reason"], "invalid_or_encrypted_image")
+        self.assertEqual(rows[urls[3]]["attempts"][0]["requests"][0]["status"], "received")
+        self.assertEqual(rows[urls[3]]["attempts"][0]["status"], "failed")
+        missing = next(row for row in result["failures"] if not row["recorded_urls"])
+        self.assertEqual(missing["reason"], "video_url_not_recorded")
+        self.assertTrue(missing["attempts_known"])
+        self.assertEqual(missing["attempts"], [])
+        self.assertEqual(len(session.calls), 3)
+        report = media.inspect_library_media(self.library, progress=lambda _: None)
+        report_rows = {row["recorded_urls"][0]: row for row in report["resources"] if row["recorded_urls"]}
+        self.assertEqual(report_rows[urls[2]]["attempts"], redirected["attempts"])
+        self.assertIn(redirect, Path(report["report_text"]).read_text(encoding="utf-8"))
+
+    def test_success_url_diagnostics_stay_out_of_reader_metadata_and_patch_payload(self):
+        url = "https://p.douyinpic.com/photo?sig=private%2Ffull&expiry=123"
+        self.add("duoshan", [{"type": 27, "content": {"resource_url": {"url_list": [url]}}}])
+        result = self.run_download(Session([Response(png_bytes())]))
+        self.assertEqual(result["totals"]["downloaded"], 1)
+        record = next(iter(media._load_manifest(self.library).values()))
+        self.assertEqual(record["recorded_urls"], [url])
+        self.assertEqual(record["attempted_urls"], [url])
+        with closing(sqlite3.connect(self.library / "reader.sqlite")) as db:
+            meta = json.loads(db.execute("SELECT meta_json FROM messages").fetchone()[0])
+        self.assertLessEqual(set(meta["media"]), media.MEDIA_FIELDS)
+        for field in ("attempts", "recorded_urls", "attempted_urls", "diagnostic", "reason_text", "messages"):
+            self.assertNotIn(field, meta["media"])
+        updates = (Path(result["work"]) / "media-updates.jsonl").read_text(encoding="utf-8")
+        self.assertNotIn(url, updates)
+        self.assertNotIn("conversation_name", updates)
+        self.assertNotIn("account_directory", updates)
+
+    def test_report_does_not_reassociate_historical_or_deleted_message_references(self):
+        uid = self.add("duoshan", [{"type": 27, "content": {"resource_url": {"url_list": ["https://p.douyinpic.com/photo"]}}}])
+        self.run_download(Session([Response(png_bytes())]))
+        with closing(sqlite3.connect(self.library / "reader.sqlite")) as db:
+            db.execute("DELETE FROM messages WHERE uid=?", (uid,)); db.commit()
+        result = media.inspect_library_media(self.library, progress=lambda _: None)
+        self.assertEqual(result["totals"]["orphaned"], 1)
+        row = result["resources"][0]
+        self.assertFalse(row["current"])
+        self.assertEqual(row["messages"], [])
+        self.assertEqual(row["historical_messages"][0]["uid"], uid)
+
+    def test_manifest_snapshot_ignores_records_appended_after_open_boundary(self):
+        self.add("duoshan", [{"type": 7, "content": "text"}])
+        media._journal(self.library, {"resource_id": "first", "status": "failed"})
+        appended = []
+        def append_during_read():
+            if not appended:
+                appended.append(True)
+                media._journal(self.library, {"resource_id": "later", "status": "ok"})
+            return False
+        records, snapshot = media._manifest_snapshot(self.library, append_during_read)
+        self.assertEqual(set(records), {"first"})
+        self.assertLess(snapshot["bytes"], (self.library / media.MANIFEST).stat().st_size)
+
+    def test_report_can_run_while_library_mutation_lock_is_held(self):
+        self.add("duoshan", [{"type": 30, "content": {}}])
+        with media._library_lock(self.library):
+            result = media.inspect_library_media(self.library, progress=lambda _: None, active_download=True)
+        self.assertEqual(result["totals"]["unsupported"], 1)
+
+    def test_cli_report_is_offline_and_returns_readable_report_paths(self):
+        from duoshan_export.cli import main
+        self.add("duoshan", [{"type": 30, "content": {}}])
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr), patch.object(media, "_session", side_effect=AssertionError("offline")):
+            code = main(["library-media-report", str(self.library), "--active-download", "--json"])
+        self.assertEqual(code, 0)
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(result["data_status"], "active_snapshot")
+        self.assertTrue(Path(result["report_html"]).is_file())
+        self.assertEqual(result["resources"][0]["recorded_urls"], [])
+
+    def test_cancelled_attempt_is_reported_without_claiming_it_never_requested(self):
+        url = "https://p.douyinpic.com/cancel?sig=full"
+        self.add("duoshan", [{"type": 27, "content": {"resource_url": {"url_list": [url]}}}])
+        cancelled = [False]
+        class CancellingResponse(Response):
+            def iter_content(response, size):
+                yield b"partial"
+                cancelled[0] = True
+                yield b"remaining"
+        result = self.run_download(Session([CancellingResponse(headers={})]), cancel=lambda: cancelled[0])
+        self.assertEqual(result["status"], "cancelled")
+        report = media.inspect_library_media(self.library, progress=lambda _: None)
+        row = report["resources"][0]
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(row["journal_status"], "cancelled")
+        self.assertEqual(row["reason"], "cancelled")
+        self.assertTrue(row["attempts_known"])
+        self.assertEqual(row["attempted_urls"], [url])
+        self.assertEqual(row["attempts"][0]["status"], "cancelled")
+        self.assertFalse(result["patch_result"])
+
     def test_opt_in_required_before_any_artifact_or_network(self):
         session = Session([])
         with patch.object(media, "_session", return_value=session):
@@ -199,7 +352,11 @@ class LibraryMediaTests(unittest.TestCase):
         self.assertEqual([url for url, _ in session.calls], ["https://p.douyinpic.com/original?signature=unchanged", "https://p.douyinpic.com/recorded-fallback"])
         self.assertTrue(rejected.closed and accepted.closed)
         manifest = (self.library / media.MANIFEST).read_text()
-        self.assertNotIn("signature=", manifest)
+        self.assertIn("signature=unchanged", manifest)
+        record = next(iter(media._load_manifest(self.library).values()))
+        self.assertEqual(record["attempts"][0]["status"], "failed")
+        self.assertEqual(record["attempts"][1]["status"], "ok")
+        self.assertEqual(record["attempts"][0]["requests"][0]["url"], "https://p.douyinpic.com/original?signature=unchanged")
 
     def test_encrypted_and_missing_media_are_reported_without_network(self):
         self.add("wechat", [{"type": 3, "_wechat_raw": {"type": 3, "content": '<msg><img aeskey="secret" cdnmidimgurl="https://m.qpic.cn/encrypted"/></msg>'}}, {"type": 34}])
@@ -395,7 +552,8 @@ class LibraryMediaTests(unittest.TestCase):
         self.assertIn(".incoming", diagnostic["resolved_path"])
         self.assertIn(diagnostic["message"], logs)
         self.assertIn("媒体路径校验失败", diagnostic["message"])
-        self.assertNotIn("private", json.dumps(result) + "".join(logs))
+        self.assertNotIn("private details", json.dumps(result) + "".join(logs))
+        self.assertNotIn("token=private", "".join(logs))
         journal_failure = next(r for r in media._load_manifest(self.library).values() if r["status"] == "failed")
         self.assertEqual(journal_failure["diagnostic"], diagnostic)
 

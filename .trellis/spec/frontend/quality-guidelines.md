@@ -36,9 +36,16 @@ messages to satisfy language tests.
   is `./`. A proxy prefix must end in `/` and be stripped upstream.
 - Render only contained local attachment URLs. Show explicit unavailable
   states rather than loading expired or remote resource URLs automatically.
+- Missing-media labels describe the recorded state: `not_downloaded` means
+  no local download is attached; generic `failed` does not prove URL expiry.
+  Direct users to local download details for the recorded reason and URLs.
 - Preserve original bubble/inline emoji metadata and place message text above
   animated corner layers. Keep original audio attachments as well as voices.
 - Surface edit/hidden badges, revision conflicts and restoration clearly.
+- Label each account with its API `source_app`: 微信, 多闪/抖音, 小红书, or
+  来源未识别. Never infer the source from an account ID or nickname.
+- Distinguish locally undownloaded media from download failure. Generic
+  failure status does not establish URL expiry; direct users to media details.
 - Translate API failures into Chinese display messages while retaining machine
   error codes. Ignore stale account/search responses after a newer request.
 - Run `npm run build` and `npm test`. Do not describe compilation or HTTP

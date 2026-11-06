@@ -84,7 +84,7 @@ test('media-only transaction preserves every other column, raw bytes, unrelated 
   const media = asset(output);
   const raw = messageRow(output).raw_json;
   const updatesFile = updateFile(root, 'patch', [{ uid: WX, msg_uuid: 'shared-id', app: 'wechat', expected_raw_sha256: sha(raw),
-    local_media: [media.path], media: { ...media, details: { downloaded: true } }, media_status: 'available' }]);
+    local_media: [media.path], media: { ...media, codec: 'verified' }, media_status: 'available' }]);
   const result = await patchLibraryMedia({ outputDir: output, updatesFile, sourceId: 'test-download' });
   assert.equal(result.patched_messages, 1);
   assert.equal(result.projection_status, 'completed');
@@ -98,7 +98,8 @@ test('media-only transaction preserves every other column, raw bytes, unrelated 
   const meta = JSON.parse(metaText);
   assert.deepEqual(meta.unknown, { keep: true });
   assert.deepEqual(meta.bubble, { side: '1' });
-  assert.deepEqual(meta.media.details, { retained: true, downloaded: true });
+  assert.deepEqual(meta.media.details, { retained: true });
+  assert.equal(meta.media.codec, 'verified');
   assert.equal(meta.media.format, 'OLD');
   assert.deepEqual(meta.local_media, [media.path]);
   for (const [table, rows] of Object.entries(protectedTables)) assert.deepEqual(query(output, `SELECT * FROM ${table}`), rows, table);
@@ -150,7 +151,7 @@ test('repeated and reordered patch batches do not duplicate paths or replace suc
   assert.deepEqual(messageRow(output), before);
   assert.deepEqual(fs.readFileSync(path.join(output, 'wx_' + WX, 'messages.jsonl')), projection);
   const failed = updateFile(root, 'later-failed', [{ uid: WX, msg_uuid: 'shared-id', local_media: [media.path, old.path],
-    original_media: [old.path], media: { status: 'failed', kind: 'file', errors: ['offline'] }, media_status: 'failed' }]);
+    original_media: [old.path], media: { status: 'failed', kind: 'file' }, media_status: 'failed' }]);
   const again = await patchLibraryMedia({ outputDir: output, updatesFile: failed });
   assert.equal(again.patched_messages, 0); assert.equal(again.unchanged_messages, 1);
   assert.deepEqual(messageRow(output), before);
@@ -216,6 +217,7 @@ test('malformed metadata, unsafe paths, nonexistent files and incorrect file has
     { local_media: ['attachments/missing.bin'] }, { local_media: ['attachments/library'] },
     { media: [] }, { media: { ...media, kind: 'invalid' } },
     { media: { ...media, bytes: media.bytes + 1 } }, { media: { ...media, sha256: '0'.repeat(64) } },
+    { media: { ...media, width: [] } }, { media: { ...media, duration: '1.0' } },
     { media_status: 1 }, { text_original: 'forbidden', local_media: [] },
     JSON.parse('{"media":{"__proto__":{"injected":true}}}'),
   ];
@@ -225,6 +227,27 @@ test('malformed metadata, unsafe paths, nonexistent files and incorrect file has
       { uid: WX, msg_uuid: 'shared-id', ...invalid[i] },
     ]);
     await assert.rejects(patchLibraryMedia({ outputDir: output, updatesFile }), undefined, JSON.stringify(invalid[i]));
+    assert.deepEqual(messageRow(output), before);
+    assert.equal(query(output, 'SELECT * FROM library_media_batches').length, 0);
+  }
+});
+
+test('full URL diagnostics and message references cannot enter reader media metadata', async t => {
+  const { root, output } = fixture(t);
+  await seed(root, output);
+  const media = asset(output);
+  const url = 'https://example.invalid/download?signature=synthetic-full-token&expires=9999';
+  const before = messageRow(output);
+  const diagnostics = {
+    recorded_urls: [url], attempted_urls: [url], source_url: url,
+    attempts: [{ recorded_url: url, requests: [{ url, requested: true }] }], attempts_known: true,
+    reason_text: 'Diagnostic only', diagnostic: { message: url },
+    messages: [{ uid: WX, msg_uuid: 'shared-id' }], details: { hidden_url: url },
+  };
+  for (const [key, value] of Object.entries(diagnostics)) {
+    const updatesFile = updateFile(root, key, [{ uid: WX, msg_uuid: 'shared-id',
+      local_media: [media.path], media: { ...media, [key]: value } }]);
+    await assert.rejects(patchLibraryMedia({ outputDir: output, updatesFile }), /report-only or unknown/);
     assert.deepEqual(messageRow(output), before);
     assert.equal(query(output, 'SELECT * FROM library_media_batches').length, 0);
   }

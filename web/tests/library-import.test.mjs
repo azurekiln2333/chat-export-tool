@@ -60,7 +60,8 @@ test('independent app imports merge, repeated import is idempotent, and prefixed
   const store = new ChatStore(output);
   try {
     assert.equal((await store.initialize({ force: true })).imported, false);
-    assert.equal(store.listAccounts().length, 3);
+    assert.deepEqual(Object.fromEntries(store.listAccounts().map(account => [account.uid, account.source_app])),
+      { [WX]: 'wechat', [DY]: 'duoshan', [XHS]: 'xhs' });
     assert.equal(store.getMessage(WX, 'wx-one').sender, WX);
     assert.equal(store.getCalendar(WX, { month: '2026-01' }).total, 1);
   } finally { store.close(); }

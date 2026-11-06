@@ -42,7 +42,9 @@ directories and the Node.js version documented in `web/package.json`.
 4. Use **导入 / 更新资料库** to run the real import pipeline. Continue choosing
    that same library for future backups or another app. New data is merged by
    the library service; the GUI does not rewrite messages itself.
-5. Open **聊天资料库** to view account totals and start the local reader.
+5. Open **聊天资料库** to view account totals and source labels (**多闪/抖音**,
+   **微信**, **小红书**) and start the local reader. **切换资料库** selects another
+   existing library and immediately refreshes this overview.
 
 Online downloads are off by default. The opt-in checkbox enables media
 downloads through the existing adapter's supported network rules.
@@ -57,6 +59,25 @@ are reused on the next run. The service only retrieves supported URLs retained
 in current library messages; expired or unsupported resources are reported.
 Refresh an already-open reader page to request the updated media references.
 No reader restart or reindex is required.
+
+**查看媒体下载详情** is available on both the library and task pages. It reads
+the selected library and download journal offline, with no backup selection,
+working-directory setting or network opt-in required. It defaults to failed and
+unsupported resources; filters also cover all statuses, app, media type, reason,
+account, message ID and URL. Large inventories are shown in pages of 200.
+The details show the recorded URL, actual attempted URLs when known, Chinese
+reasons and the related accounts/messages. Full signed URLs remain selectable;
+**复制此资源全部 URL** copies the complete recorded and attempted addresses.
+Missing addresses are identified explicitly. Old journals without attempt
+history are marked unknown, rather than implying that no request was made.
+
+This view uses an independent background reader and remains available during
+an active download. Its timestamped snapshot can be refreshed; closing the
+detail window cancels only that read and leaves the download running. Opening,
+filtering, refreshing or copying details never visits a remote URL. The service
+also saves uniquely named local HTML, text and JSON reports in
+`LIBRARY/media_reports`, including the full URLs. Their paths appear in the
+dialog. Detail errors do not replace the active task's progress or results.
 
 WeChat key material is normally discovered from the backup. If automatic
 decryption fails, the settings page accepts an optional database password or
@@ -85,8 +106,21 @@ parent is selected when available; otherwise the default is
 
 The reader starts on an available loopback port with a unique startup log in
 `LIBRARY/import_logs`. The GUI opens the browser after the reader responds. It
-does not stop existing reader instances or use `--reindex`. Closing the GUI
-leaves the reader running so an open browser remains usable.
+does not use `--reindex`. When this GUI already manages a reader, selecting a
+different library stops that exact child process, restarts the reader on the
+same port with the selected directory and opens the page when ready.
+**重载阅读器** performs the same operation for the current library, useful after
+updating the reader build. Only the process handle created by this GUI can be
+stopped; readers started elsewhere or by earlier GUI instances are left alone.
+Without a managed reader, selecting a library changes the overview;
+**打开聊天阅读器** or **重载阅读器** starts it. A failed or timed-out switch is
+reported without forcibly killing other processes. Closing the GUI normally
+leaves its running reader available so an open browser remains usable.
+
+Account source labels use `library_accounts.app` when recorded. Older exports
+can fall back to explicit folder prefixes, account statistics, saved message
+export metadata or an unambiguous single-app export summary. Unknown sources
+are labelled explicitly rather than guessed from account ID length.
 
 The physical account folders identify the source: `wx_` for WeChat, `xhs_` for
 Xiaohongshu and `dy_` for Duoshan. Account IDs used by messages and annotations

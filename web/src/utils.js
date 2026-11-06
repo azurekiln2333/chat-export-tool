@@ -19,6 +19,16 @@ export function plural(count, one, many) {
   return Number(count) === 1 ? one : many;
 }
 
+/** Account source is supplied by the reader API, independently of its UID. */
+export function accountSourceLabel(account) {
+  switch (account?.source_app) {
+    case 'wechat': return '微信';
+    case 'duoshan': return '多闪/抖音';
+    case 'xhs': return '小红书';
+    default: return '来源未识别';
+  }
+}
+
 /** Guess a media kind from a file extension for reused local attachments. */
 export function kindFromPath(path) {
   const clean = String(path || '').toLowerCase().split(/[?#]/)[0];

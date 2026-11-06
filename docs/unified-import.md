@@ -106,8 +106,8 @@ workspace's confirmation and recycling rules.
 Staging directories are created and validated before starting parallel downloads.
 Individual worker failures are journaled while other completed resources still
 attach to the reader. Directory validation failures include local root/resolved
-path diagnostics and a Chinese progress message; they do not expose URLs or
-signed tokens. Rerunning the action retries the failed resources.
+path diagnostics and a Chinese progress message. Rerunning the action retries
+the failed resources.
 
 `library_media_manifest.jsonl` is an append-only recovery journal. Every completed
 download is flushed before the operation continues. Cancelled operations keep
@@ -119,8 +119,55 @@ message is counted without needlessly regenerating its account export.
 Results include `totals.downloaded`, `existing`, `failed` and `unsupported`,
 a failure list with reasons, and the Node patch result. Counts are resources,
 not messages; one resource may be referenced by many messages, and one message
-may have both a photo and video. Download URLs, signed tokens and key material
-are omitted from logs, results and the recovery journal.
+may have both a photo and video. Local journals and result details preserve
+full recorded URLs and per-attempt request/redirect results, including signed
+query strings explicitly requested for diagnosis. Cryptographic key fields
+remain excluded. Progress messages explain reason codes without printing URL
+lists. These private reports/journals must stay outside the source repository.
+
+### Read media details without downloading
+
+```powershell
+python -m duoshan_export library-media-report D:\ChatLibrary --active-download --json
+```
+
+`inspect_library_media(output, *, accounts=None, progress=print, cancel=None,
+active_download=None)` reads the current SQLite inventory and the latest
+complete journal entry for each resource. It does not acquire the mutation
+lock, contact a server or write message data, so it can run beside downloading.
+The service creates uniquely named JSON, HTML and text reports in
+`media_reports/`, returning `report_json`, `report_html`, `report_text`, `totals`
+and `resources`. Full URLs appear as selectable text; the HTML does not load
+remote content or automatically open URLs.
+
+Journal reads stop at the file size observed when opened, ignore torn final
+lines, and retain the latest complete entry per resource. The report records
+its snapshot time and whether downloading was reported active or the journal
+grew during scanning. A pending result does not prove a request has started;
+it can mean waiting, running or a previous interrupted operation. Counts refer
+to this snapshot, not necessarily a completed download job.
+
+For old journals, recorded URL candidates and account/message references are
+reconstructed from current live messages. `attempts_known=false` means the old
+log did not record which URL was requested; the report never labels candidates
+as attempted requests. New journals distinguish `recorded_urls`, successful or
+failed `attempts`, actual `attempted_urls`, and rejected redirect destinations
+with `requested=false`. Historical resources no longer found in live messages
+are marked `orphaned`, with old references separate from current references.
+
+Typical Chinese explanations distinguish:
+
+| Outcome | Meaning |
+| --- | --- |
+| Missing recorded URL | The backup supplied no downloadable address. |
+| Unsupported host | The original or redirect host is outside the app allowlist; the tool did not request that destination. This does not prove the file is absent. |
+| Encrypted WeChat resource | The recorded resource requires an unsupported encrypted CDN protocol. |
+| HTTP 403 | The server refused access; the code alone cannot distinguish signature expiry, permissions or server restrictions. |
+| Invalid image | Received bytes failed image decoding and may be a non-image error response, encrypted content or damaged data. |
+
+Diagnostic URLs, attempts and message references never enter reader media
+metadata. Python and Node use explicit media-field allowlists at the patch
+boundary, preserving existing raw rows and unrelated metadata.
 
 ## Account names and media
 

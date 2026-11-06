@@ -21,3 +21,17 @@ Synthetic and real read-only checks cover detection, decryption, outgoing/incomi
 - Read authoritative live library messages; download only recorded, supported media URLs. Store verified local files beneath that library's `attachments`, update reader metadata, and keep existing messages, raw values, edits and deletion suppression unchanged.
 - Repeating or resuming the operation reuses valid local assets. Show successful, existing, failed and unsupported resources; cancellation retains completed work. Offline behavior remains the default.
 - Report actual Git state and provide consistent commit wording. Do not silently include unrelated files or private backup data in commits.
+
+## Follow-up: explain media outcomes and show URLs
+
+- Explain failed versus unsupported media with readable Chinese reasons.
+- Show recorded URLs, attempted URLs when known, and message/account references in a local detailed report and GUI. Preserve full signed URLs as requested by the user.
+- A missing recorded URL must display that fact, never invent an address. Historical journals can be matched against current live messages without downloading again.
+- Keep the active download running; diagnostic reads do not alter message data. Private URLs/reports stay outside the source repository.
+
+## Follow-up: library selection and source labels
+
+- Select a different library directly on the library page, refresh its account list and reload the GUI-managed reader for that library. Also provide an explicit reader reload action.
+- Remove the entire directory-explanation card from the GUI.
+- Display account sources as `多闪/抖音`, `微信` or `小红书` in both the desktop library list and reader account list, using stored source metadata.
+- Diagnose the reported unavailable emoji using live data and download results. Distinguish recognition, local availability and failed downloads; do not claim a generic failure proves URL expiry.

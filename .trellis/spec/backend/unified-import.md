@@ -20,6 +20,8 @@ import_history(output) -> list[dict]
 download_library_media(output, work, *, accounts=None, progress=print,
                        cancel=None, node="node", workers=6,
                        download_media=False)
+inspect_library_media(output, *, accounts=None, progress=print,
+                      cancel=None, active_download=None)
 ```
 
 `scan`, `import` and `organize`/`adopt` are additive CLI commands. Preserve
@@ -32,6 +34,20 @@ Post-import downloads use `library-media OUTPUT --work-dir WORK
 The result includes `status`, `totals` (`downloaded`, `existing`, `failed`,
 `unsupported`), `failures`, `manifest`, `patch_result`, `recovery_result` and
 the retained work run. The GUI uses the same explicit opt-in service.
+
+Offline details use `library-media-report OUTPUT [--account UID ...]
+[--active-download] [--json]`. `inspect_library_media` returns `status`,
+`as_of`, `completed_at`, `data_status`, `snapshot_note`, `journal_snapshot`,
+`totals`, `resources`, and unique `report_html`, `report_text`, `report_json`
+paths under `OUTPUT/media_reports/`. Resource details include `recorded_urls`,
+`attempts`, `attempts_known`, `attempted_urls`, `reason_text`, and current
+`messages` references. `attempted_urls` includes only actual requests; a
+redirect denied before networking is recorded as `requested: false`.
+Legacy entries without attempts keep `attempts_known: false`, even when
+recorded candidates can be recovered from current messages. HTML renders
+escaped text with no external resource loads. GUI details use plain text,
+filters, pagination and explicit URL copying; their separate read worker may
+run while downloading and never changes the network opt-in.
 
 The Node boundary is `importLibrary({sourceDir,outputDir,app,sourceId,
 project=true,preserveExisting=false})` and `organizeLibrary({outputDir})`.
@@ -106,6 +122,16 @@ source, account, result and projection state. `store_meta.library_mode` is
   individual worker/path failure must be recorded without losing successful
   results from other workers. Record resolved-path diagnostics locally without
   exposing signed resource URLs in exception messages.
+- User-requested media details may display full recorded and attempted URLs,
+  preserving signed query strings. Keep them in local diagnostic reports and
+  journal/result fields, never in source-controlled fixtures, arbitrary
+  exception text or reader display metadata. Provide Chinese reason labels
+  alongside stable machine codes. Missing URLs remain explicitly absent.
+- Offline diagnostic snapshots use the latest journal entry per resource and
+  current live inventory. For legacy entries, reconstruct recorded candidates
+  only; do not claim they were attempted. A partial final journal line is
+  ignored. Viewing/exporting details must not fetch URLs, acquire the importer
+  mutation lock, restart the downloader, or write to message tables.
 - The media patch boundary changes only media metadata on matching live
   account/message rows. Preserve raw JSON, message columns, edits and deletion
   suppression. Multiple media resources must have a stable primary so a repeat
@@ -113,6 +139,15 @@ source, account, result and projection state. `store_meta.library_mode` is
 - Desktop branding is `Chat Archive`. Settings write to
   `%LOCALAPPDATA%/ChatArchive/settings.json`; read the legacy
   `AzureKilnChatArchive/settings.json` only as a fallback and retain it.
+- Library-page selection refreshes accounts and reloads a running reader owned
+  by the current GUI. Same-library reload is explicit. Stop only the saved
+  `Popen` handle and poll asynchronously with a bounded wait; never enumerate
+  or stop unrelated Node processes. Reuse the managed reader port after exit.
+  Reader launch requires the selected library and Node, not backup/work paths.
+- Desktop account rows display a source column with `多闪/抖音`, `微信`, or
+  `小红书`. Prefer authoritative `library_accounts.app`, then explicit legacy
+  directory/metadata evidence; never infer source from an account ID's shape.
+  The library page has no directory-explanation card.
 
 ## Validation / Error Matrix
 
@@ -132,6 +167,12 @@ source, account, result and projection state. `store_meta.library_mode` is
 | Row deleted or raw content changed after inventory | Skip its media patch; never restore stale message content |
 | Existing local photo plus missing video in one message | Reuse the photo, retrieve the missing video, keep a stable primary |
 | A concurrent download worker fails | Record its failure; journal and attach other completed downloads |
+| Details are requested while downloading | Read a finite journal snapshot and current SQLite snapshot; label ongoing results and allow a later refresh |
+| A legacy journal lacks attempted URLs | Show recorded candidates and explicitly unknown historical attempts |
+| A resource is absent from current message rows | Label its journal entry historical; do not restore messages or treat historical references as current |
+| A signed URL contains HTML markup | Preserve the full URL as escaped/selectable text; never render it as markup or load it |
+| A selected library differs from the managed reader | Refresh account data, stop only that reader and relaunch against the selected library |
+| A managed reader does not exit before timeout | Report that switching did not complete; retain its ownership and do not launch a second process |
 
 ## Good / Base / Bad Cases
 
@@ -165,6 +206,15 @@ Run Qt cases with the GUI dependencies available; backend-only installations
 may skip only those optional GUI cases. Node media-patch assertions are listed
 in the reader contract.
 
+Details tests cover missing URLs, signed query preservation, denied redirects,
+HTTP and asset-validation reasons, latest-entry selection, torn journal lines,
+removed messages, unique report names, no networking/DB mutations, and exclusion
+of diagnostic fields at both Python and Node media patch boundaries. Qt checks
+exercise independent details/download workers, filters, pagination and copying.
+Reader-control checks cover library selection, same-library reload, bounded
+shutdown failure, invalid destinations and independent Node processes. Source
+labels must prefer registered identity over conflicting legacy metadata.
+
 ## Wrong vs Correct
 
 Wrong: set own WeChat sender to `me`, use `msgSvrId` globally, and rebuild all
@@ -176,3 +226,7 @@ canonical aliases, and transactionally merge only the imported account rows.
 Wrong: rerun a legacy exporter over the library to attach newly downloaded
 files. Correct: read current live rows and apply guarded media metadata patches,
 then refresh only affected account projections.
+
+Wrong: present current recorded candidates as proven historical HTTP attempts.
+Correct: distinguish recorded, requested, denied and unknown attempt data, and
+keep full diagnostic URLs in local reports rather than reader metadata.

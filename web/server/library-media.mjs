@@ -11,6 +11,10 @@ import { deletionHash, hashFile, readJsonLines } from './store.mjs';
 
 const MEDIA_FIELDS = ['local_media', 'original_media', 'media', 'media_status'];
 const INPUT_FIELDS = new Set(['uid', 'msg_uuid', 'app', 'expected_raw_sha256', ...MEDIA_FIELDS]);
+// Download diagnostics (including full signed URLs) belong only in local
+// reports/journals. A resource patch carries playback/file properties only.
+const RESOURCE_FIELDS = new Set(['status', 'kind', 'path', 'sha256', 'bytes', 'format', 'source_format',
+  'width', 'height', 'frames', 'duration', 'mime', 'codec']);
 const KINDS = new Set(['voice', 'emoji', 'audio', 'image', 'video', 'file']);
 const STATUSES = new Set(['ok', 'failed', 'missing_url', 'missing', 'unsupported', 'unavailable']);
 const MEDIA_STATUSES = new Set(['available', 'partial', 'missing', 'failed', 'unsupported', 'none']);
@@ -21,14 +25,6 @@ const SCHEMA = `CREATE TABLE IF NOT EXISTS library_media_batches (
 
 function object(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-
-function assertSafeObject(value) {
-  if (!object(value) && !Array.isArray(value)) return;
-  for (const [key, child] of Object.entries(value)) {
-    if (['__proto__', 'constructor', 'prototype'].includes(key)) throw new Error('Unsafe media metadata key.');
-    assertSafeObject(child);
-  }
 }
 
 function validateUpdate(row) {
@@ -52,14 +48,20 @@ function validateUpdate(row) {
   if (Object.hasOwn(row, 'media')) {
     const resource = row.media;
     if (!object(resource)) throw new Error('media must be a resource object.');
-    assertSafeObject(resource);
+    if (Object.keys(resource).some(key => !RESOURCE_FIELDS.has(key))) throw new Error('media contains report-only or unknown fields.');
     if (Object.hasOwn(resource, 'kind') && !KINDS.has(resource.kind)) throw new Error('Invalid media kind.');
     if (Object.hasOwn(resource, 'status') && !STATUSES.has(resource.status)) throw new Error('Invalid media status.');
     if (Object.hasOwn(resource, 'path') && (typeof resource.path !== 'string' || !resource.path)) throw new Error('Invalid media path.');
     if (resource.status === 'ok' && (!resource.path || !resource.kind)) throw new Error('Successful media requires kind and path.');
     if (Object.hasOwn(resource, 'bytes') && (!Number.isSafeInteger(resource.bytes) || resource.bytes < 0)) throw new Error('Invalid media byte count.');
     if (Object.hasOwn(resource, 'sha256') && (typeof resource.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(resource.sha256))) throw new Error('Invalid media hash.');
-    for (const key of ['mime', 'format', 'codec']) {
+    for (const key of ['width', 'height', 'frames']) {
+      if (Object.hasOwn(resource, key) && (!Number.isSafeInteger(resource[key]) || resource[key] < 0)) throw new Error(`Invalid media ${key}.`);
+    }
+    if (Object.hasOwn(resource, 'duration') && (typeof resource.duration !== 'number' || !Number.isFinite(resource.duration) || resource.duration < 0)) {
+      throw new Error('Invalid media duration.');
+    }
+    for (const key of ['mime', 'format', 'source_format', 'codec']) {
       if (Object.hasOwn(resource, key) && typeof resource[key] !== 'string') throw new Error(`Invalid media ${key}.`);
     }
   }

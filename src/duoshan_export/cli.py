@@ -128,6 +128,11 @@ def build_parser() -> argparse.ArgumentParser:
     library_media.add_argument("--node", default="node")
     library_media.add_argument("--download-media", action="store_true", help="Required explicit consent for online media retrieval")
     _json_flag(library_media)
+    media_report = commands.add_parser("library-media-report", help="Create an offline local report of media results and full recorded URLs")
+    media_report.add_argument("output", type=_path)
+    media_report.add_argument("--account", action="append", default=[], metavar="UID")
+    media_report.add_argument("--active-download", action="store_true", help="Label this report as a snapshot of an active download")
+    _json_flag(media_report)
     return parser
 
 
@@ -400,6 +405,9 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _dispatch(args) -> dict:
+    if args.command == "library-media-report":
+        from .library_media import inspect_library_media
+        return inspect_library_media(args.output, accounts=args.account or None, active_download=True if args.active_download else None)
     if args.command == "library-media":
         from .library_media import download_library_media
         return download_library_media(args.output, args.work_dir or args.output.with_name(args.output.name + ".work"),

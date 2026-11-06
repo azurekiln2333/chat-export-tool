@@ -9,7 +9,7 @@ import LoginPanel from './LoginPanel.vue';
 import MessagePane from './MessagePane.vue';
 import ToastStack from './ToastStack.vue';
 import { currentAccount, initialize, logout, reloadWorkspace, selectAccount, state } from '../store.js';
-import { appTitle } from '../utils.js';
+import { accountSourceLabel, appTitle } from '../utils.js';
 
 const sidebarOpen = ref(false);
 
@@ -61,14 +61,14 @@ function changeAccount(event) {
         <select
           id="account-select"
           class="select"
-          style="width: auto; max-width: 240px"
+          style="width: auto; max-width: 320px"
           :value="state.accountUid"
           :disabled="state.accountsBusy || !state.accounts.length"
           @change="changeAccount"
         >
           <option v-if="!state.accounts.length" value="">没有账号</option>
           <option v-for="account in state.accounts" :key="account.uid" :value="account.uid">
-            {{ account.name }} · {{ Number(account.message_count).toLocaleString('zh-CN') }} 条
+            {{ accountSourceLabel(account) }} · {{ account.name }} · {{ Number(account.message_count).toLocaleString('zh-CN') }} 条
           </option>
         </select>
 

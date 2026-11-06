@@ -48,6 +48,28 @@ Keep real-data probes outside the repository and report only aggregate
 counts. Verify directory migration, media bytes/ranges, original file hashes,
 and the production build separately from any visual browser inspection.
 
+## Account source labels
+
+`GET api/accounts` includes `source_app` (`wechat`, `duoshan`, `xhs`, or an
+empty string when unidentified). `library_accounts.app` is authoritative;
+unknown nonempty registry values must not be overridden by a guessed source.
+For legacy accounts without registry metadata, use an explicit `wx_`/`dy_`/
+`xhs_` directory prefix, then the account's `statistics.json.app`, then the
+first stored message's `raw_json._export.app` (one indexed lookup), then a
+single recognized `export_summary.json.app`. Match known labels exactly;
+combined summary labels and UID shape cannot identify individual accounts.
+Resolving labels is read-only and never changes message identities or edits.
+
+The account selector prefixes each account name with 微信, 多闪/抖音 or
+小红书, using this API field. Unidentified accounts show 来源未识别.
+Store regressions cover registry priority, prefixed and unprefixed legacy
+directories, mixed summaries, unknown apps and unchanged exported files.
+
+Media unavailability text reflects only recorded local state: `not_downloaded`
+means not downloaded locally, while `failed` directs the user to library media
+details. Neither status alone proves an expired URL. Remote addresses remain
+explicit diagnostic/fallback information and are never loaded automatically.
+
 ## Permanent deletion and calendar contracts
 
 ### 1. Scope / Trigger
@@ -172,9 +194,14 @@ Each JSONL row requires string `uid`/`msg_uuid` and at least one of
 `local_media`, `original_media`, `media`, or `media_status`. Optional `app` and
 `expected_raw_sha256` guard against a changed message during downloading.
 The digest is SHA-256 of the exact UTF-8 `raw_json`. Other fields are rejected.
-The resource `media` is a flat object (`kind`, `status`, `path`, optional
-`bytes`, `sha256`, `mime`, `format`, codec details). Successful resources need
-`kind` and `path`. Local media lists contain strings only; resolve all new
+The resource `media` is a flat object allowing only `kind`, `status`, `path`,
+`bytes`, `sha256`, `mime`, `format`, `source_format`, `codec`, `width`, `height`,
+`frames`, and `duration`. These are scalar file/playback properties; reject
+unknown fields and diagnostic payloads (`recorded_urls`, `attempted_urls`,
+`attempts`, `diagnostic`, `reason_text`, `messages`, or arbitrary nested
+`details`). Full signed URLs belong in the separate local report/journal,
+never in a reader media patch. Existing unrelated metadata remains intact.
+Successful resources need `kind` and `path`. Local media lists contain strings only; resolve all new
 paths under the real library `attachments` directory, rejecting traversal,
 alternate streams and escaping junctions. Check supplied size/hash values.
 
@@ -203,7 +230,7 @@ previous files. Report `patched_messages`, `unchanged_messages`,
 `skipped_messages`, `repeated`, affected `accounts`, and `projection_status`.
 
 `library-media.test.mjs` independently verifies exact non-media preservation,
-unsafe numeric/raw literals, cross-app identity guards, deleted/stale skips,
+unsafe numeric/raw literals, URL/diagnostic-field rejection, cross-app identity guards, deleted/stale skips,
 semantic and fingerprint idempotence, multi-resource primary stability,
 corrupt-primary replacement, whole-batch rollback on bad paths/types/hashes,
 junction containment, interrupted projection retry and CLI recovery. Use

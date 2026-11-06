@@ -56,3 +56,61 @@ The user approved the conventional-commit grouping in `commit-plan.md` and
 explicitly requested pushing to origin/master on 2026-11-07. Original data,
 libraries, local settings and external QA artifacts are excluded. Commit
 identifiers and remote publication are verified through Git history.
+
+
+## Media diagnostics, library switching and source labels (2026-11-07)
+
+- Offline report generation joins a finite latest-per-resource journal snapshot
+  to current live messages, preserving signed URLs and distinguishing unknown
+  historical requests from actual attempts. HTML is escaped and never requests
+  remote content. Missing/deleted message references remain historical.
+- Python and Node media patch boundaries accept explicit media fields only;
+  URL diagnostics and message references cannot enter reader display metadata.
+- The desktop has independent media-details workers, status/source/type/search
+  filters, pagination and full URL copying. A real service integration proved
+  zero HTTP requests, unchanged database hash and successful reporting while
+  the library mutation lock was held.
+- Library selection and explicit reload use only the GUI-owned process handle,
+  preserve its port and wait asynchronously for exit. A real Qt-to-Node test
+  switched between independent synthetic libraries, observed new account data
+  at the same port and then reloaded the same library. On Windows, Popen
+  terminate terminates the owned process; graceful SIGTERM handling is not
+  claimed. No live user reader or download was stopped for QA.
+- The directory-explanation card is removed. Desktop and web account lists show
+  source labels from registered identity, with explicit legacy evidence as a
+  fallback and unknown sources retained as unknown. Raw metadata is read by an
+  indexed single-account lookup without scanning the complete message table.
+- Full Node regression before the final legacy-fallback addition: 162 passed.
+  Final source-fallback store/client/import checks: 29 passed. Production Vite
+  build passed with --emptyOutDir false. Python/Qt final results are recorded
+  below. Cross-layer review found no unresolved blocker.
+- Qt screenshots were visually inspected at 1180 x 780 for the revised library
+  page and 1120 x 780 for media details. These are offscreen Qt renders, not a
+  claimed capture of the user's active desktop. Browser visual QA is not claimed.
+- Read-only diagnosis confirmed the reported emoji was extracted correctly and
+  had a latest HTTP 403 failure with no local attachment. A successful emoji
+  returned matching local file bytes from both running library readers, and
+  the actual frontend message model marked it available. This distinguishes
+  resource-specific download failure from an all-emoji rendering failure.
+- A local full-URL report was generated outside Git for the user's selected
+  library. Private URLs, message identifiers and media were not copied into
+  repository fixtures. Original backups remained untouched.
+
+External synthetic QA evidence:
+
+- D:/ChatImportWork/gui-media-details-qa-o298jrgy/library-page.png
+- D:/ChatImportWork/gui-media-details-qa-o298jrgy/media-details.png
+- D:/ChatImportWork/gui-media-details-qa-1fz76mxa/results.json
+- D:/ChatImportWork/gui-reader-switch-qa-e5n26t_8/results.json
+- D:/AppData/Local/Temp/chat-followup-qt-complete-20261107-054418.log
+
+Final Python run: 199 tests, 187 passed and 12 optional Qt skips in the
+backend-only environment. Separate installed-Qt run: all 16 GUI tests passed,
+including every skipped control plus settings/source tests. Final logs:
+D:/AppData/Local/Temp/chat-followup-python-complete-20261107-054418.log and
+D:/AppData/Local/Temp/chat-followup-qt-complete-20261107-054418.log.
+
+Workspace retention: task evidence is retained in place. The standard archive
+command removes session files with unlink; it was not used because the parent
+AGENTS.md prohibits permanent deletion. Task completion is recorded without
+removing runtime or task files.

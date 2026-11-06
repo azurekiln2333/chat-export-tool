@@ -68,7 +68,9 @@ export function isAvailable(resource) {
 
 export const MEDIA_UNAVAILABLE_LABEL = {
   missing_url: '备份未保存媒体地址',
-  failed: '原始地址已失效，未能下载',
+  not_downloaded: '尚未下载到本地，可在资料库查看下载详情',
+  failed: '媒体下载失败，可在资料库查看下载详情',
+  unsupported: '当前无法获取此媒体，可在资料库查看具体原因',
 };
 
 export function unavailableLabel(resource) {
