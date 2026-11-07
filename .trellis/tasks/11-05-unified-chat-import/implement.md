@@ -39,3 +39,11 @@
 1. Format and emit full-URL status lines from completed download/reuse/unsupported/cancelled results with accurate attempt provenance.
 2. Verify backend callbacks and actual Qt worker/log rendering using intercepted network fixtures, including signed URLs, HTTP403, fallback, existing files and absent URLs.
 3. Update documentation/specification and record checks, then commit/push within prior authorization. Do not restart an active user download.
+
+## WeChat long-stage progress correction
+
+1. Read-only inspect live process/stage artifacts and cancellation history, distinguish quiet progress from a hang.
+2. Add phase progress for media validation/extraction, image/voice conversion and final message rewrite; cover blocking waits and cancellation with synthetic fixtures.
+3. Run appropriate WeChat and Python regression checks, review data fidelity/no cross-app changes, update docs/spec/evidence, commit and push. No automatic live import or GUI restart.
+4. Pass typed numeric phase progress through the GUI worker and render determinate bars for known totals, indeterminate bars otherwise. Extend observability through source hashing, reader preparation and merge while preserving CLI JSON output.
+5. Exclude the requested reader port range and stop only the owned reader when the GUI closes. Test range boundaries, shutdown failures, cancellation and phase transitions with isolated fixtures.

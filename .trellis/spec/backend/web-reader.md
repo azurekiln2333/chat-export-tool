@@ -70,6 +70,25 @@ means not downloaded locally, while `failed` directs the user to library media
 details. Neither status alone proves an expired URL. Remote addresses remain
 explicit diagnostic/fallback information and are never loaded automatically.
 
+## Incremental import progress
+
+`importLibrary`, `organizeLibrary` and `projectAccounts` accept an optional
+observational `progress` callback with `{message,stage,completed,total,unit,state}`.
+Events are throttled to about two seconds, with explicit stage start/end.
+Unknown totals are `null`; fingerprint bytes are counted from actual reads,
+merged rows from completed processing, and projection rows from SQL counts.
+Never infer message counts from file size. Stage completion is not whole-import
+completion: merge completes after its transaction commits, and projection only
+after all affected files publish. A projection error preserves the pending batch
+for retry and reports failure without undoing committed messages.
+
+CLI progress goes to stderr as `CHAT_ARCHIVE_PROGRESS ` followed by JSON;
+stdout remains one JSON result. Callback exceptions are ignored because display
+failures must not change transaction/commit outcomes. The Python caller owns
+whole-task completion after it validates the result. Tests verify exact preexisting
+fingerprints, unknown totals, rollback/projection recovery, callback failures and
+separate stderr/stdout framing.
+
 ## Permanent deletion and calendar contracts
 
 ### 1. Scope / Trigger

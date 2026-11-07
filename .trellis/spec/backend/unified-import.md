@@ -22,6 +22,8 @@ download_library_media(output, work, *, accounts=None, progress=print,
                        download_media=False)
 inspect_library_media(output, *, accounts=None, progress=print,
                       cancel=None, active_download=None)
+ProgressEvent(text, *, stage, completed=None, total=None, unit="个",
+              state="running")  # str subclass; state also completed/failed/cancelled
 ```
 
 `scan`, `import` and `organize`/`adopt` are additive CLI commands. Preserve
@@ -88,6 +90,22 @@ source, account, result and projection state. `store_meta.library_mode` is
   and choose by exit code. Native stderr must not prevent Python fallback.
 - No automatic deletion or pruning. Retain stages and previous metadata for
   diagnosis and require workspace-compliant confirmation for later cleanup.
+- Long import stages emit string-compatible `ProgressEvent` callbacks, including
+  start/end and five-second liveness during blocked I/O or codec calls. Count only
+  actual processed units; use `total=None` for unknown archive members/merge rows.
+  Report bytes where exact record totals are unavailable without another scan.
+  The GUI reads attributes before string redaction and uses queued Qt signals;
+  it shows phase counts/percentage separately from overall task completion.
+  Stop and join heartbeat threads before leaving the phase, even on error or
+  cancellation. Never replay an old phase heartbeat after the next phase begins.
+- Reader subprocess stderr streams prefixed structured events while stdout stays
+  one result JSON. Drain both pipes concurrently, keep transactions running if a
+  display callback fails, and join readers before returning. Only a zero exit
+  code and a result object with `status=completed` authorize final completion.
+- Retrying a cancelled unified import starts a new retained run; prior final
+  attachments are hash-verified for reuse, but private scan/conversion markers
+  are run-scoped. Do not describe this as full checkpoint resume or imply that
+  attachments alone establish a completed reader import.
 - WeChat source identity is account-scoped: server ID plus talker when
   available; otherwise local ID, timestamp, type, direction, talker and raw
   content. Outgoing `sender` must equal the internal account UID, because
@@ -153,6 +171,11 @@ source, account, result and projection state. `store_meta.library_mode` is
   `Popen` handle and poll asynchronously with a bounded wait; never enumerate
   or stop unrelated Node processes. Reuse the managed reader port after exit.
   Reader launch requires the selected library and Node, not backup/work paths.
+- New reader ports and reused ports must exclude 64967–65066 inclusive. Closing
+  the GUI cancels its tasks and stops only its saved reader Popen handle; wait
+  asynchronously, escalate that same handle after a bounded grace period, and
+  keep the window open with an error if shutdown fails. Disable new actions
+  while closing. Never enumerate or kill unrelated Node processes.
 - Desktop account rows display a source column with `多闪/抖音`, `微信`, or
   `小红书`. Prefer authoritative `library_accounts.app`, then explicit legacy
   directory/metadata evidence; never infer source from an account ID's shape.
@@ -182,6 +205,11 @@ source, account, result and projection state. `store_meta.library_mode` is
 | A signed URL contains HTML markup | Preserve the full URL as escaped/selectable text; never render it as markup or load it |
 | A selected library differs from the managed reader | Refresh account data, stop only that reader and relaunch against the selected library |
 | A managed reader does not exit before timeout | Report that switching did not complete; retain its ownership and do not launch a second process |
+| A known-count stage is running | Show actual phase completed/total and percentage, never a guessed whole-import percentage |
+| Archive traversal or a codec blocks between updates | Keep a five-second liveness log with last confirmed counts and current action |
+| A cancelled first import left attachments but no reader DB | Preserve files; report incomplete import and the fresh-run retry limitation |
+| Reader exits zero with invalid JSON/null/error result | Fail without emitting final merge completion |
+| GUI closes while it owns a reader | Stop that handle, wait asynchronously, and leave unrelated readers alone |
 
 ## Good / Base / Bad Cases
 
@@ -224,6 +252,14 @@ Reader-control checks cover library selection, same-library reload, bounded
 shutdown failure, invalid destinations and independent Node processes. Source
 labels must prefer registered identity over conflicting legacy metadata.
 
+Progress tests cover blocked archive/codec callbacks, exact totals, cache reuse,
+unknown totals, cancellation and error shutdown with no heartbeat remaining.
+Library tests independently reproduce fingerprints, preserve BOM/raw integers
+while measuring bytes, and stream Node stderr before completion. Qt tests cover
+phase changes and final status, reserved-port boundaries, shutdown escalation
+and refusal to start new work while closing. Use isolated fixtures; never restart
+a live import to test progress.
+
 ## Wrong vs Correct
 
 Wrong: set own WeChat sender to `me`, use `msgSvrId` globally, and rebuild all
@@ -239,3 +275,7 @@ then refresh only affected account projections.
 Wrong: present current recorded candidates as proven historical HTTP attempts.
 Correct: distinguish recorded, requested, denied and unknown attempt data, and
 keep full diagnostic URLs in local reports rather than reader metadata.
+
+Wrong: log one extraction banner, leave an indeterminate bar through all later
+stages, or call 100% extracted files a completed import. Correct: show each stage
+and its actual counters; only the final successful service result finishes the task.

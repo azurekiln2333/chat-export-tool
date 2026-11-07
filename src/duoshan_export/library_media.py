@@ -629,8 +629,12 @@ def _existing(meta, resource, output, count, cache=None):
 
 
 def _inventory(output, accounts, progress, cancel):
+    from .progress import ProgressEvent
     resources = {}
     scanned, last_progress = 0, time.monotonic()
+    total = None
+    stage = "扫描资料库媒体"
+    progress(ProgressEvent("正在统计待扫描的资料库记录。", stage=stage, completed=0, unit="条"))
     database = sqlite3.connect((output / "reader.sqlite").as_uri() + "?mode=ro", uri=True)
     try:
         database.execute("PRAGMA query_only=ON")
@@ -642,17 +646,15 @@ def _inventory(output, accounts, progress, cancel):
         unknown = wanted - account_apps.keys()
         if unknown:
             raise ExportError("Requested account is not present in this library.")
+        total = sum(database.execute("SELECT COUNT(*) FROM messages WHERE uid=?", (uid,)).fetchone()[0] for uid in wanted)
+        progress(ProgressEvent(f"开始扫描 {total:,} 条资料库记录。", stage=stage, completed=0, total=total, unit="条"))
         for uid in sorted(wanted):
             app = account_apps[uid]
-            progress("识别资料库媒体：" + app)
+            progress(ProgressEvent("识别资料库媒体：" + app, stage=stage, completed=scanned, total=total, unit="条"))
             for index, (uuid, raw_text, meta_text, typ, conversation_id, conversation_name) in enumerate(database.execute("SELECT msg_uuid,raw_json,meta_json,message_type,conversation_id,conversation_name FROM messages WHERE uid=?", (uid,))):
                 if index % 1000 == 0:
                     _check(cancel)
                 raw, meta = json.loads(raw_text), json.loads(meta_text)
-                scanned += 1
-                if time.monotonic() - last_progress >= 5:
-                    progress(f"已扫描 {scanned:,} 条记录，识别 {len(resources):,} 个媒体资源。")
-                    last_progress = time.monotonic()
                 items = _extract_resources(app, raw, meta, typ)
                 for item in items:
                     identity = item["identity"] if item["urls"] else uid + "\0" + uuid + "\0" + item["identity"]
@@ -670,6 +672,17 @@ def _inventory(output, accounts, progress, cancel):
                         "account_directory": account_directories[uid],
                         "expected_raw_sha256": hashlib.sha256(raw_text.encode()).hexdigest(),
                         "present_paths": list(dict.fromkeys([*local, *meta.get("original_media", []), *([primary["path"]] if primary.get("path") else [])]))})
+                scanned += 1
+                if time.monotonic() - last_progress >= 5:
+                    progress(ProgressEvent(f"已扫描 {scanned:,}/{total:,} 条记录，识别 {len(resources):,} 个媒体资源。",
+                        stage=stage, completed=scanned, total=total, unit="条"))
+                    last_progress = time.monotonic()
+        progress(ProgressEvent(f"扫描完成：{scanned:,}/{total:,} 条记录，识别 {len(resources):,} 个媒体资源。",
+            stage=stage, completed=scanned, total=total, unit="条", state="completed"))
+    except _Cancelled:
+        progress(ProgressEvent(f"媒体扫描已停止，已处理 {scanned:,} 条记录。",
+            stage=stage, completed=scanned, total=total, unit="条", state="cancelled"))
+        raise
     except sqlite3.Error as error:
         raise ExportError("Choose a managed reader library with readable account/message tables.") from error
     finally:
@@ -884,22 +897,25 @@ def _download(item, output, run, node, cancel):
 
 
 def _patch(output, updates, node, progress):
+    from .progress import StageReporter
     executable = shutil.which(node)
     script = Path(__file__).resolve().parents[2] / "web/server/library-media.mjs"
     if not executable or not script.is_file():
         raise ExportError("The complete reader tool and Node.js are required to attach downloaded media.")
     options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
     args = ["--updates", str(updates)] if updates is not None else ["--resume"]
-    result = subprocess.run([executable, str(script), "--output", str(output), *args, "--json"],
-                            capture_output=True, text=True, encoding="utf-8", **options)
-    if result.returncode:
-        raise ExportError("Media files are retained, but the reader metadata patch failed: " + result.stderr[:500])
-    return json.loads(result.stdout)
+    with StageReporter(progress, "恢复媒体索引" if updates is None else "写入媒体索引"):
+        result = subprocess.run([executable, str(script), "--output", str(output), *args, "--json"],
+                                capture_output=True, text=True, encoding="utf-8", **options)
+        if result.returncode:
+            raise ExportError("Media files are retained, but the reader metadata patch failed: " + result.stderr[:500])
+        return json.loads(result.stdout)
 
 
 def download_library_media(output, work, *, accounts=None, progress=print, cancel=None,
                            node="node", workers=6, download_media=False):
     """Download recorded media only after explicit opt-in; return durable totals."""
+    from .progress import ProgressEvent
     if progress is print:
         progress = _print_progress
     if download_media is not True:
@@ -922,7 +938,6 @@ def download_library_media(output, work, *, accounts=None, progress=print, cance
     failures, successful = [], []
     cancelled = False
     with _library_lock(output):
-        progress("检查并恢复未完成的媒体索引更新。")
         recovery_result = _patch(output, None, node, progress)
         known = _load_manifest(output)
         try:
@@ -930,11 +945,13 @@ def download_library_media(output, work, *, accounts=None, progress=print, cance
         except _Cancelled:
             return {"status": "cancelled", "totals": totals, "failures": [], "manifest": str(output / MANIFEST)}
         run = _new_run(work, "library-media")
-        progress(f"已识别 {len(inventory):,} 个媒体资源；开始校验已有文件。")
+        progress(ProgressEvent(f"已识别 {len(inventory):,} 个媒体资源；开始校验已有文件。",
+            stage="校验已有媒体", completed=0, total=len(inventory)))
         pending_items = []
         reported_diagnostics = set()
         reported_reasons = set()
         last_completion_progress = time.monotonic()
+        validating = True
         def completed(item, record, existing=False):
             nonlocal last_completion_progress
             record = {"resource_id": item["resource_id"], "app": item["app"], "kind": item["kind"], **record}
@@ -966,19 +983,18 @@ def download_library_media(output, work, *, accounts=None, progress=print, cance
                                  **_resource_details(item, record),
                                  **({"diagnostic": record["diagnostic"]} if record.get("diagnostic") else {})})
             count = sum(totals.values())
-            if time.monotonic() - last_completion_progress >= 2 or count == len(inventory):
-                progress(f"媒体 {count:,}/{len(inventory):,}：下载 {totals['downloaded']}，已有 {totals['existing']}，失败 {totals['failed']}，不支持 {totals['unsupported']}")
+            if not validating and (time.monotonic() - last_completion_progress >= 2 or count == len(inventory)):
+                progress(ProgressEvent(f"媒体 {count:,}/{len(inventory):,}：下载 {totals['downloaded']}，已有 {totals['existing']}，失败 {totals['failed']}，不支持 {totals['unsupported']}",
+                    stage="补全在线媒体", completed=count, total=len(inventory)))
                 last_completion_progress = time.monotonic()
         validation_cache, existing_cache = {}, {}
         validated_started = time.monotonic()
+        validated = 0
         for item in inventory.values():
             if cancel and cancel():
                 cancelled = True
                 break
             record = known.get(item["resource_id"])
-            if time.monotonic() - validated_started >= 5:
-                progress(f"已校验 {sum(totals.values()):,}/{len(inventory):,} 个媒体资源。")
-                validated_started = time.monotonic()
             if _valid_record(record, output, validation_cache):
                 completed(item, record, True)
             else:
@@ -990,7 +1006,17 @@ def download_library_media(output, work, *, accounts=None, progress=print, cance
                     completed(item, {"status": "unsupported", "reason": item["reason"]})
                 else:
                     pending_items.append(item)
+            validated += 1
+            if time.monotonic() - validated_started >= 5:
+                progress(ProgressEvent(f"已校验 {validated:,}/{len(inventory):,} 个媒体资源。",
+                    stage="校验已有媒体", completed=validated, total=len(inventory)))
+                validated_started = time.monotonic()
+        progress(ProgressEvent(f"已校验 {validated:,}/{len(inventory):,} 个媒体资源。", stage="校验已有媒体",
+            completed=validated, total=len(inventory), state="cancelled" if cancelled else "completed"))
+        validating = False
         if not cancelled:
+            progress(ProgressEvent(f"开始补全媒体：已处理 {sum(totals.values()):,}/{len(inventory):,} 个资源。",
+                stage="补全在线媒体", completed=sum(totals.values()), total=len(inventory)))
             # Pre-create shared paths sequentially before concurrent first use.
             # Every worker validates an existing directory, never a missing tree.
             incoming_by_app = {}
@@ -1043,6 +1069,9 @@ def download_library_media(output, work, *, accounts=None, progress=print, cance
                             completed(item, {"status": "failed", "reason": "worker_" + type(error).__name__, "attempts_known": False})
                     if not cancelled:
                         submit()
+        progress(ProgressEvent(f"媒体已处理 {sum(totals.values()):,}/{len(inventory):,} 个资源。", stage="补全在线媒体",
+            completed=sum(totals.values()), total=len(inventory), state="cancelled" if cancelled else "completed"))
+        progress(ProgressEvent("正在写入已完成的媒体引用。", stage="写入媒体索引"))
         updates = run / "media-updates.jsonl"
         with updates.open("x", encoding="utf-8", newline="\n") as stream:
             for item, record in successful:
@@ -1055,6 +1084,8 @@ def download_library_media(output, work, *, accounts=None, progress=print, cance
             stream.flush()
             os.fsync(stream.fileno())
         patch_result = _patch(output, updates, node, progress) if successful else None
+        if not successful:
+            progress(ProgressEvent("已完成的媒体引用已保存。", stage="写入媒体索引", state="completed"))
         result = {"status": "cancelled" if cancelled else "completed", "totals": totals, "failures": failures,
                   "manifest": str(output / MANIFEST), "patch_result": patch_result, "recovery_result": recovery_result, "work": str(run)}
         (run / "result.json").write_text(json.dumps(result, ensure_ascii=True, indent=2), encoding="utf-8")

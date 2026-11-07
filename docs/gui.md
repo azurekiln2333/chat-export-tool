@@ -49,6 +49,16 @@ directories and the Node.js version documented in `web/package.json`.
 Online downloads are off by default. The opt-in checkbox enables media
 downloads through the existing adapter's supported network rules.
 
+Import and task pages show the **current stage**, actual completed/total counts
+and a percentage whenever the total is known. This percentage belongs to that
+stage, not the whole import. Source verification and reader-file preparation
+use byte counts; message export, referenced-media extraction and conversion use
+record/file counts. Uncounted archive traversal remains indeterminate and shows
+the latest action, scanned members and elapsed time. Long WeChat disk/codec
+stages report at least every five seconds while waiting; stage boundaries and
+completion are logged immediately. Reader merge progress is streamed live.
+Failure/cancellation keeps the last actual count instead of claiming success.
+
 After an offline import, open **聊天资料库**, check **允许下载记录中的在线媒体**,
 then click **补下载在线媒体**. This independent operation covers all accounts in
 the current library and needs no original backup selection. Checking the box
@@ -114,7 +124,8 @@ parent is selected when available; otherwise the default is
 
 ## Reader behavior
 
-The reader starts on an available loopback port with a unique startup log in
+The reader starts on an available loopback port outside **64967–65066**
+(inclusive), with a unique startup log in
 `LIBRARY/import_logs`. The GUI opens the browser after the reader responds. It
 does not use `--reindex`. When this GUI already manages a reader, selecting a
 different library stops that exact child process, restarts the reader on the
@@ -124,8 +135,13 @@ updating the reader build. Only the process handle created by this GUI can be
 stopped; readers started elsewhere or by earlier GUI instances are left alone.
 Without a managed reader, selecting a library changes the overview;
 **打开聊天阅读器** or **重载阅读器** starts it. A failed or timed-out switch is
-reported without forcibly killing other processes. Closing the GUI normally
-leaves its running reader available so an open browser remains usable.
+reported without forcibly killing other processes. Closing the GUI stops its
+owned reader, requests cancellation of running GUI tasks, and waits for their
+safe exit before closing. Only the saved reader process handle is stopped;
+unrelated services are never enumerated or terminated. A reader that does not
+exit is stopped forcibly after a bounded wait; a shutdown failure keeps the
+window open and reports the error. Browser tabs may remain open after the
+reader service has exited.
 
 Account source labels use `library_accounts.app` when recorded. Older exports
 can fall back to explicit folder prefixes, account statistics, saved message

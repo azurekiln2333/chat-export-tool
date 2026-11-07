@@ -31,3 +31,11 @@ Account source labels come from `library_accounts.app`; legacy exports may use t
 ## Direct download log URLs
 
 Emit explicit per-resource/attempt outcome lines through the existing progress callback after completion, alongside throttled aggregate counters. Distinguish recorded candidates from actual requests, redirects, cached files and missing URLs; do not mislabel unattempted fallback candidates. Keep full URLs as local plain text, never reader metadata. Bound GUI document size using the existing retained-journal/report model. No real media requests or process restarts for QA.
+
+## WeChat media-stage progress
+
+Track actual extraction/copy/reuse and decoder results with explicit stage start, periodic progress/elapsed time and final summaries. Blocking archive skips and single decoder waits must remain visibly identifiable; a heartbeat must not fabricate completion or percentages. Keep progress lifecycle bounded and stop background reporting on completion/cancellation/error. Preserve content hashes, cancellation, retained partials, conversion semantics and Duoshan/XHS behavior.
+
+Use a string-compatible ProgressEvent carrying stage/completed/total/unit/state, so CLI text callbacks remain compatible while the GUI receives numeric state before redaction/string conversion. Source fingerprinting reports processed bytes, reader JSONL preparation reports bytes and actual row counts, and the Node merge emits optional structured stderr events while stdout remains one result JSON. Report phase progress rather than estimating a global percentage. Stream and drain both subprocess pipes; send periodic liveness during uncounted waits without claiming completion.
+
+Exclude ports 64967–65066 from new selection and managed-reader reuse. GUI shutdown asynchronously terminates and, after a bounded grace period, kills only its saved reader process; close only once that process has exited. Preserve the existing active-task cancellation flow and never enumerate/terminate unrelated services.

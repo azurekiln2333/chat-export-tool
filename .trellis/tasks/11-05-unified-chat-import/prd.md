@@ -39,3 +39,9 @@ Synthetic and real read-only checks cover detection, decryption, outgoing/incomi
 ## Follow-up: per-resource URLs directly in task logs
 
 The user requires visible status-prefixed full URLs in the running download log, rather than only aggregate counts or a separate details dialog. Show successful, reused, failed and unsupported outcomes directly; retain full signed query strings and reasons. Missing URLs remain explicit. Preserve the current running downloader and existing retrieval behavior.
+
+## Follow-up: observable long WeChat media stages
+
+The reported import remains visually silent after the referenced-media extraction banner. Show ongoing stage and meaningful completed/total progress while extracting/verifying media, converting WXGF previews and voice playback, and writing final message references. Keep completed assets and originals unchanged; do not restart or resume a live import for verification.
+
+The user additionally requires actual phase counts in the GUI progress bar, continuous visibility through source verification and reader preparation/merge, and no invented whole-import percentage. Unknown totals remain explicitly indeterminate. The reader must never choose a port in 64967–65066 inclusive, and closing the GUI must close its owned reader process.

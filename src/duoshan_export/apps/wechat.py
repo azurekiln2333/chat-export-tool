@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import base64
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from datetime import datetime
 import hashlib
 import json
@@ -21,18 +21,112 @@ import sqlite3
 import struct
 import subprocess
 import threading
+import time
 import uuid
 import xml.etree.ElementTree as ET
 from zoneinfo import ZoneInfo
 
 from ..database import _load_sqlcipher
 from ..errors import ExportError
+from ..progress import ProgressEvent
 from ..source import _open_tar, _safe_parts, _looks_like_archive_file
 
 APP_PACKAGE = 'com.tencent.mm'
 HASH = re.compile(r'^[0-9a-f]{32}$')
 TYPE_LABELS = {1:'文本',3:'图片',34:'语音',42:'名片',43:'视频',47:'表情',48:'位置',49:'文件',62:'视频',10000:'系统消息',10002:'系统消息'}
 MEDIA_DIRS = {'image2','image','video','voice2','voice','attachment','emoji','record'}
+PROGRESS_INTERVAL = 5.0
+
+
+class _StageProgress:
+    """Report real stage state even while the main thread waits on disk/codecs."""
+    def __init__(self, progress, label, *, cancel=None, unit='个', **state):
+        self.progress, self.label = progress, label
+        self.cancel, self.unit = cancel, unit
+        self.state = dict(state)
+        self.lock = threading.Lock()
+        self.stopped = threading.Event()
+        self.thread = None
+        self.error = None
+        self.started = time.monotonic()
+
+    def __enter__(self):
+        self._emit('开始')
+        self.thread = threading.Thread(target=self._heartbeat, name='wechat-stage-progress', daemon=True)
+        self.thread.start()
+        return self
+
+    def update(self, **state):
+        with self.lock:
+            self.state.update(state)
+            error = self.error
+        if error is not None:
+            raise error
+
+    def add(self, **changes):
+        with self.lock:
+            for key, count in changes.items():
+                self.state[key] = self.state.get(key, 0) + count
+            error = self.error
+        if error is not None:
+            raise error
+
+    def _emit(self, status):
+        with self.lock:
+            state = dict(self.state)
+        parts = [f'{self.label}：{status}']
+        if 'done' in state:
+            parts.append(f"已处理 {state['done']:,}" + (f"/{state['total']:,}" if 'total' in state else '') + ' ' + self.unit)
+        for key, label in (('reused','复用'),('copied','新复制'),('converted','新转换'),('failed','失败'),('pending','待提取'),('scanned','已见成员')):
+            if key in state:
+                parts.append(f'{label} {state[key]:,}')
+        if 'bytes' in state:
+            parts.append(f"已处理字节 {state['bytes']:,}" + (f"/{state['bytes_total']:,}" if 'bytes_total' in state else ''))
+        if 'position' in state:
+            parts.append(f"最近成员起始位置 {state['position']:,} 字节（解压后）")
+        if state.get('action'):
+            parts.append(state['action'])
+        if state.get('current'):
+            parts.append('当前 ' + state['current'])
+        if 'current_bytes' in state:
+            parts.append(f"当前文件 {state['current_bytes']:,}/{state.get('current_total', 0):,} 字节")
+        parts.append(f'耗时 {time.monotonic() - self.started:.1f} 秒')
+        terminal=status in {'完成','结束','中断'}
+        if terminal and self.cancel and self.cancel():
+            outcome='cancelled'
+        elif status=='中断' or (terminal and state.get('failed',0) and state.get('total') is not None
+                               and state.get('done',0)<state['total']):
+            outcome='failed'
+        else:
+            outcome='completed' if terminal else 'running'
+        self.progress(ProgressEvent('；'.join(parts),stage=self.label,completed=state.get('done'),
+            total=state.get('total'),unit=self.unit,state=outcome))
+
+    def _heartbeat(self):
+        while not self.stopped.wait(PROGRESS_INTERVAL):
+            try:
+                self._emit('进行中')
+            except Exception as error:
+                with self.lock:
+                    self.error = error
+                self.stopped.set()
+
+    def __exit__(self, kind, value, traceback):
+        self.stopped.set()
+        if self.thread is not None:
+            self.thread.join()
+        if self.error is not None:
+            if kind is None:
+                raise self.error
+            return False
+        if kind is None:
+            self._emit('完成' if self.state.get('done') == self.state.get('total') else '结束')
+        else:
+            try:
+                self._emit('中断')
+            except Exception:
+                pass  # Keep the original processing/cancellation error.
+        return False
 
 
 def _check(cancel):
@@ -105,11 +199,13 @@ def _media_member(parts):
     return 'MicroMsg' in parts and any(p in MEDIA_DIRS for p in parts) and not parts[-1].endswith(('.tmp','.bak'))
 
 
-def _sha(path, cancel=None):
+def _sha(path, cancel=None, stage=None):
     h=hashlib.sha256()
+    if stage:stage.update(current=Path(path).name,current_bytes=0,current_total=Path(path).stat().st_size)
     with Path(path).open('rb') as f:
         for b in iter(lambda:f.read(4*1024*1024),b''):
             _check(cancel);h.update(b)
+            if stage:stage.add(current_bytes=len(b))
     return h.hexdigest()
 
 
@@ -119,30 +215,35 @@ def _separate(a, b, label):
         raise ExportError(label)
 
 
-def _verified_copy(source, target, digest, cancel=None):
+def _verified_copy(source, target, digest, cancel=None, stage=None):
     """Publish only a complete verified file; retain interrupted files for review."""
     target=Path(target);target.parent.mkdir(parents=True,exist_ok=True)
     if target.exists():
-        if _sha(target,cancel)!=digest:raise ExportError('现有文件内容校验不符：'+str(target))
+        if _sha(target,cancel,stage)!=digest:raise ExportError('现有文件内容校验不符：'+str(target))
         return
     partial=target.with_name(target.name+'.partial-'+uuid.uuid4().hex[:12])
     h=hashlib.sha256()
+    if stage:stage.update(current=Path(source).name,current_bytes=0,current_total=Path(source).stat().st_size)
     with Path(source).open('rb') as src,partial.open('xb') as dst:
         for block in iter(lambda:src.read(4*1024*1024),b''):
             _check(cancel);h.update(block);dst.write(block)
+            if stage:stage.add(current_bytes=len(block))
     if h.hexdigest()!=digest:raise ExportError('复制期间源文件已改变，请重新扫描备份。')
     partial.rename(target)
 
 
-def _cached_metadata(cache, manifest, cancel=None):
+def _cached_metadata(cache, manifest, cancel=None, progress=print):
     try:
         data=json.loads(manifest.read_text(encoding='utf-8'))
         entries=data['metadata']
         if not entries:return None
-        for entry in entries:
-            path=(cache/entry['path']).resolve()
-            if not path.is_relative_to(cache) or not path.is_file() or _sha(path,cancel)!=entry['sha256']:
-                return None
+        with _StageProgress(progress,'校验微信数据库缓存',cancel=cancel,done=0,total=len(entries),reused=0,failed=0) as stage:
+            for entry in entries:
+                path=(cache/entry['path']).resolve()
+                if not path.is_relative_to(cache) or not path.is_file() or _sha(path,cancel,stage)!=entry['sha256']:
+                    stage.add(failed=1)
+                    return None
+                stage.add(done=1,reused=1)
         return data
     except (OSError,KeyError,ValueError,TypeError):
         return None
@@ -157,23 +258,30 @@ def prepare_backup(source,work,*,progress=print,cancel=None,scan_media=False):
                      and not p.name.lower().startswith(('apk','icon','user_de'))))
     if archives:
         identity=hashlib.sha256()
-        for p in archives:
-            progress('校验微信备份：'+p.name);identity.update(p.name.encode());identity.update(_sha(p,cancel).encode())
+        with _StageProgress(progress,'校验微信备份包',cancel=cancel,done=0,total=len(archives),bytes=0,
+                bytes_total=sum(p.stat().st_size for p in archives)) as stage:
+            for p in archives:
+                stage.update(action='读取备份并计算完整 SHA-256')
+                identity.update(p.name.encode());identity.update(_sha(p,cancel,stage).encode())
+                stage.add(done=1,bytes=p.stat().st_size)
         cache=work/('wechat-'+identity.hexdigest()[:20]);cache.mkdir(exist_ok=True)
         manifest=cache/('media-scan.json' if scan_media else 'database-scan.json')
-        info=_cached_metadata(cache,manifest,cancel) if manifest.is_file() else None
+        info=_cached_metadata(cache,manifest,cancel,progress) if manifest.is_file() else None
         if info:
             info['archives']=archives;info['root']=cache
             return info
         previous=cache/'database-scan.json'
-        prior=_cached_metadata(cache,previous,cancel) if previous.is_file() else None
+        prior=_cached_metadata(cache,previous,cancel,progress) if previous.is_file() else None
         verified={entry['path']:entry for entry in prior['metadata']} if prior else {}
         media=[];metadata={}
         for p in archives:
-            progress('扫描微信备份：'+p.name)
-            with _open_tar(p) as archive:
+            with _StageProgress(progress,'扫描微信备份 '+p.name,cancel=cancel,done=0,scanned=0,bytes=0,
+                    action='读取归档成员；成员总数未知') as stage, _open_tar(p) as archive:
                 for member in archive:
                     _check(cancel)
+                    stage.add(scanned=1)
+                    stage.update(position=member.offset,current=Path(member.name).name,current_bytes=0,current_total=member.size,
+                                 action='扫描/跳过非目标成员，继续定位数据库和媒体')
                     parts=_safe_parts(member.name)
                     if not member.isfile() or not parts:continue
                     meta=_metadata_member(parts,member.size);is_media=scan_media and _media_member(parts)
@@ -185,24 +293,31 @@ def prepare_backup(source,work,*,progress=print,cancel=None,scan_media=False):
                             relative=target.relative_to(cache).as_posix()
                             if relative in verified:
                                 metadata[relative]=verified[relative]
+                                stage.add(done=1,reused=1)
                                 continue
                             if target.exists():target.rename(target.with_name(target.name+'.unverified-'+uuid.uuid4().hex[:12]))
                             partial=target.with_name(target.name+'.partial-'+uuid.uuid4().hex[:12])
                             h=hashlib.sha256();size=0
+                            stage.update(action='提取数据库或备份配置')
                             with partial.open('xb') as dest:
                                 for block in iter(lambda:f.read(4*1024*1024),b''):
                                     _check(cancel);h.update(block);size+=len(block);dest.write(block)
+                                    stage.add(bytes=len(block),current_bytes=len(block))
                             if size!=member.size:raise ExportError('备份数据库提取不完整。')
                             partial.rename(target)
                             metadata[relative]={'path':relative,'size':size,'sha256':h.hexdigest()}
                         elif is_media:
                             h=hashlib.sha256();head=f.read(64);h.update(head)
+                            stage.update(action='读取媒体并计算完整 SHA-256')
+                            stage.add(bytes=len(head),current_bytes=len(head))
                             for block in iter(lambda:f.read(4*1024*1024),b''):
                                 _check(cancel);h.update(block)
+                                stage.add(bytes=len(block),current_bytes=len(block))
                             category,ext=_category(parts,head)
                             media.append({'archive':str(p),'member':member.name,'size':member.size,
                                           'sha256':h.hexdigest(),'category':category,'ext':ext})
-                    if len(media) and len(media)%25000==0:progress(f'已索引微信媒体 {len(media):,} 个')
+                    stage.add(done=1)
+                    stage.update(action=f'已索引媒体 {len(media):,} 个；扫描下一成员')
         info={'media':media,'metadata':list(metadata.values()),'fingerprint':identity.hexdigest()}
         manifest.write_text(_dump(info),encoding='utf-8')
         info.update(root=cache,archives=archives)
@@ -215,12 +330,14 @@ def prepare_backup(source,work,*,progress=print,cancel=None,scan_media=False):
     if not dbs:raise ExportError('没有找到微信 EnMicroMsg.db 或 DataBackup 备份包。')
     media=[]
     if scan_media:
-        for p in roots[0].rglob('*'):
-            _check(cancel)
-            if p.is_file() and _media_member(p.parts):
-                with p.open('rb') as f:category,ext=_category(p.parts,f.read(64))
-                media.append({'file':str(p),'member':p.relative_to(roots[0]).as_posix(),'size':p.stat().st_size,
-                              'sha256':_sha(p,cancel),'category':category,'ext':ext})
+        with _StageProgress(progress,'索引微信媒体目录',cancel=cancel,done=0,scanned=0,bytes=0,action='目录总文件数未知') as stage:
+            for p in roots[0].rglob('*'):
+                _check(cancel);stage.add(scanned=1)
+                if p.is_file() and _media_member(p.parts):
+                    with p.open('rb') as f:category,ext=_category(p.parts,f.read(64))
+                    media.append({'file':str(p),'member':p.relative_to(roots[0]).as_posix(),'size':p.stat().st_size,
+                                  'sha256':_sha(p,cancel,stage),'category':category,'ext':ext})
+                    stage.add(done=1,bytes=p.stat().st_size)
     return {'root':roots[0],'archives':[],'media':media}
 
 
@@ -362,31 +479,37 @@ def _playable_images(items,output,work,progress,cancel=None):
     """Keep WeChat WXGF bytes and expose a PNG preview of the first HEVC frame."""
     replacements={};warnings=[];output=Path(output).resolve()
     work=Path(work)/'image-playback';work.mkdir(parents=True,exist_ok=True)
-    for item in items:
-        _check(cancel)
-        if item['ext']!='.wxgf':continue
-        original=item['export_path'];marker=work/(item['sha256']+'.json')
-        if marker.is_file():
-            try:
-                cached=json.loads(marker.read_text(encoding='utf-8'));target=(output/cached['path']).resolve()
-                if target.is_relative_to(output) and target.is_file() and _sha(target,cancel)==cached['sha256']:
-                    replacements[original]=cached['path'];continue
-            except (OSError,ValueError,KeyError):pass
-        preview=work/(item['sha256']+'-'+uuid.uuid4().hex[:8]+'.png')
-        try:
-            options={'creationflags':subprocess.CREATE_NO_WINDOW} if os.name=='nt' else {}
-            result=subprocess.run(['ffmpeg','-v','error','-f','hevc','-i',str(output/original),
-                '-frames:v','1','-update','1','-n',str(preview)],capture_output=True,timeout=120,**options)
-            if result.returncode or not preview.is_file():raise ExportError('WXGF 预览转换失败')
-            with preview.open('rb') as check:
-                if check.read(8)!=b'\x89PNG\r\n\x1a\n':raise ExportError('WXGF 预览格式无效')
-            digest=_sha(preview,cancel);relative='attachments/wechat/'+item['category']+'/'+digest+'.png'
-            _verified_copy(preview,output/relative,digest,cancel)
-            marker.write_text(_dump({'path':relative,'sha256':digest}),encoding='utf-8')
-            replacements[original]=relative
-        except (OSError,ValueError,ExportError,subprocess.SubprocessError) as error:
+    selected=[item for item in items if item['ext']=='.wxgf']
+    with _StageProgress(progress,'转换微信 WXGF 图片预览',cancel=cancel,done=0,total=len(selected),converted=0,reused=0,failed=0) as stage:
+        for item in selected:
             _check(cancel)
-            warnings.append('WXGF 图片保留原件，但预览转换未完成：'+type(error).__name__)
+            original=item['export_path'];marker=work/(item['sha256']+'.json')
+            stage.update(current=Path(original).name,action='检查已有图片转换记录',current_bytes=0,current_total=item['size'])
+            if marker.is_file():
+                try:
+                    cached=json.loads(marker.read_text(encoding='utf-8'));target=(output/cached['path']).resolve()
+                    if target.is_relative_to(output) and target.is_file() and _sha(target,cancel,stage)==cached['sha256']:
+                        replacements[original]=cached['path'];stage.add(done=1,reused=1);continue
+                except (OSError,ValueError,KeyError):pass
+            preview=work/(item['sha256']+'-'+uuid.uuid4().hex[:8]+'.png')
+            try:
+                stage.update(action='等待 FFmpeg 图片转换；单文件超时上限 120 秒')
+                options={'creationflags':subprocess.CREATE_NO_WINDOW} if os.name=='nt' else {}
+                result=subprocess.run(['ffmpeg','-v','error','-f','hevc','-i',str(output/original),
+                    '-frames:v','1','-update','1','-n',str(preview)],capture_output=True,timeout=120,**options)
+                if result.returncode or not preview.is_file():raise ExportError('WXGF 预览转换失败')
+                with preview.open('rb') as check:
+                    if check.read(8)!=b'\x89PNG\r\n\x1a\n':raise ExportError('WXGF 预览格式无效')
+                stage.update(action='校验并发布 PNG 预览')
+                digest=_sha(preview,cancel,stage);relative='attachments/wechat/'+item['category']+'/'+digest+'.png'
+                _verified_copy(preview,output/relative,digest,cancel,stage)
+                marker.write_text(_dump({'path':relative,'sha256':digest}),encoding='utf-8')
+                replacements[original]=relative;stage.add(done=1,converted=1)
+            except (OSError,ValueError,ExportError,subprocess.SubprocessError) as error:
+                _check(cancel)
+                warnings.append('WXGF 图片保留原件，但预览转换未完成：'+type(error).__name__)
+                stage.add(done=1,failed=1)
+                stage.update(action='当前预览转换失败；原件保留：'+type(error).__name__)
     return replacements,sorted(set(warnings))
 
 
@@ -409,78 +532,103 @@ def _playable_audio(items,output,work,progress,cancel=None):
         try:
             for line in process.stdout:inbox.put(line)
         finally:inbox.put('')
-    try:
-        for item in items:
-            _check(cancel)
-            if item['ext'] not in ('.silk','.amr'):continue
-            original=item['export_path'];src=output/original;marker=work/(item['sha256']+'.json')
-            if marker.exists():
-                cached=json.loads(marker.read_text(encoding='utf-8'));target=(output/cached['path']).resolve()
-                if target.is_relative_to(output.resolve()) and target.is_file() and _sha(target,cancel)==cached['sha256']:
-                    replacements[original]=cached['path'];continue
-            wav_path=work/(item['sha256']+'-'+uuid.uuid4().hex[:8]+'.wav')
-            try:
-                if item['ext']=='.silk':
-                    if decoder is None:
-                        options={'creationflags':subprocess.CREATE_NO_WINDOW} if os.name=='nt' else {}
-                        decoder=subprocess.Popen(['node',str(decoder_script)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL,text=True,encoding='utf-8',**options)
-                        responses=queue.Queue()
-                        threading.Thread(target=read_responses,args=(decoder,responses),daemon=True).start()
-                    decoder.stdin.write(_dump({'source':str(src),'output':str(wav_path)})+'\n');decoder.stdin.flush()
-                    try:response=responses.get(timeout=60)
-                    except queue.Empty:raise ExportError('SILK 解码超时')
-                    if not response or not json.loads(response).get('ok'):raise ExportError('SILK 解码失败')
-                else:
-                    options={'creationflags':subprocess.CREATE_NO_WINDOW} if os.name=='nt' else {}
-                    result=subprocess.run(['ffmpeg','-v','error','-i',str(src),'-ac','1','-ar','24000','-c:a','pcm_s16le','-y',str(wav_path)],capture_output=True,timeout=120,**options)
-                    if result.returncode:raise ExportError('AMR 解码失败')
-                digest=_sha(wav_path);relative='attachments/wechat/audio/'+digest+'.wav';target=output/relative
-                _verified_copy(wav_path,target,digest,cancel)
-                marker.write_text(_dump({'path':relative,'sha256':digest}),encoding='utf-8')
-                replacements[original]=relative
-            except (OSError,ValueError,ExportError,RuntimeError,subprocess.SubprocessError) as error:
+    selected=[item for item in items if item['ext'] in ('.silk','.amr')]
+    with _StageProgress(progress,'转换微信语音播放文件',cancel=cancel,done=0,total=len(selected),converted=0,reused=0,failed=0) as stage:
+        try:
+            for item in selected:
                 _check(cancel)
-                stop_decoder()
-                warnings.append('语音播放转换未完成：'+type(error).__name__)
-    finally:stop_decoder()
+                original=item['export_path'];src=output/original;marker=work/(item['sha256']+'.json')
+                stage.update(current=Path(original).name,action='检查已有语音转换记录',current_bytes=0,current_total=item['size'])
+                if marker.exists():
+                    cached=json.loads(marker.read_text(encoding='utf-8'));target=(output/cached['path']).resolve()
+                    if target.is_relative_to(output.resolve()) and target.is_file() and _sha(target,cancel,stage)==cached['sha256']:
+                        replacements[original]=cached['path'];stage.add(done=1,reused=1);continue
+                wav_path=work/(item['sha256']+'-'+uuid.uuid4().hex[:8]+'.wav')
+                try:
+                    if item['ext']=='.silk':
+                        stage.update(action='等待 SILK 语音解码；单文件超时上限 60 秒')
+                        if decoder is None:
+                            options={'creationflags':subprocess.CREATE_NO_WINDOW} if os.name=='nt' else {}
+                            decoder=subprocess.Popen(['node',str(decoder_script)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL,text=True,encoding='utf-8',**options)
+                            responses=queue.Queue()
+                            threading.Thread(target=read_responses,args=(decoder,responses),daemon=True).start()
+                        decoder.stdin.write(_dump({'source':str(src),'output':str(wav_path)})+'\n');decoder.stdin.flush()
+                        try:response=responses.get(timeout=60)
+                        except queue.Empty:raise ExportError('SILK 解码超时')
+                        if not response or not json.loads(response).get('ok'):raise ExportError('SILK 解码失败')
+                    else:
+                        stage.update(action='等待 FFmpeg AMR 语音转换；单文件超时上限 120 秒')
+                        options={'creationflags':subprocess.CREATE_NO_WINDOW} if os.name=='nt' else {}
+                        result=subprocess.run(['ffmpeg','-v','error','-i',str(src),'-ac','1','-ar','24000','-c:a','pcm_s16le','-y',str(wav_path)],capture_output=True,timeout=120,**options)
+                        if result.returncode:raise ExportError('AMR 解码失败')
+                    stage.update(action='校验并发布 WAV 播放文件')
+                    digest=_sha(wav_path,cancel,stage);relative='attachments/wechat/audio/'+digest+'.wav';target=output/relative
+                    _verified_copy(wav_path,target,digest,cancel,stage)
+                    marker.write_text(_dump({'path':relative,'sha256':digest}),encoding='utf-8')
+                    replacements[original]=relative;stage.add(done=1,converted=1)
+                except (OSError,ValueError,ExportError,RuntimeError,subprocess.SubprocessError) as error:
+                    _check(cancel)
+                    stop_decoder()
+                    warnings.append('语音播放转换未完成：'+type(error).__name__)
+                    stage.add(done=1,failed=1)
+                    stage.update(action='当前语音转换失败；原件保留：'+type(error).__name__)
+        finally:
+            # Cleanup must not replace an active cancellation/decoder exception
+            # with a delayed progress callback error.
+            with stage.lock:stage.state['action']='关闭语音解码进程'
+            stop_decoder()
     return replacements,sorted(set(warnings))
 
 
 def _write_media(items,output,work,*,progress=print,cancel=None):
     """Second archive pass writes only referenced absent media, never all media twice."""
     output=Path(output);work=Path(work);mapping={};pending=defaultdict(dict)
-    for item in items:
-        _check(cancel)
-        rel='attachments/wechat/'+item['category']+'/'+item['sha256']+item['ext'];dest=output/rel
-        item['export_path']=rel
-        if dest.is_file():
-            if dest.stat().st_size!=item['size'] or _sha(dest,cancel)!=item['sha256']:
-                raise ExportError('现有微信附件校验不符：'+rel)
-            mapping[item['sha256']]=rel;continue
-        if item.get('file'):
-            _verified_copy(item['file'],dest,item['sha256'],cancel)
-            mapping[item['sha256']]=rel
-        else:pending[item['archive']][item['member']]=item
+    with _StageProgress(progress,'校验和复制微信媒体',cancel=cancel,done=0,total=len(items),reused=0,copied=0,pending=0,
+            bytes=0,bytes_total=sum(item['size'] for item in items)) as stage:
+        for item in items:
+            _check(cancel)
+            rel='attachments/wechat/'+item['category']+'/'+item['sha256']+item['ext'];dest=output/rel
+            item['export_path']=rel
+            if dest.is_file():
+                stage.update(action='校验已有附件完整 SHA-256')
+                if dest.stat().st_size!=item['size'] or _sha(dest,cancel,stage)!=item['sha256']:
+                    raise ExportError('现有微信附件校验不符：'+rel)
+                mapping[item['sha256']]=rel;stage.add(reused=1,bytes=item['size'])
+            elif item.get('file'):
+                stage.update(action='复制并校验缺少的附件')
+                _verified_copy(item['file'],dest,item['sha256'],cancel,stage)
+                mapping[item['sha256']]=rel;stage.add(copied=1,bytes=item['size'])
+            else:
+                pending[item['archive']][item['member']]=item;stage.add(pending=1)
+            stage.add(done=1)
     for archive_name,wanted in pending.items():
-        progress(f'提取已引用微信媒体：{Path(archive_name).name}（{len(wanted):,} 个）')
-        with _open_tar(Path(archive_name)) as archive:
+        with _StageProgress(progress,'提取已引用微信媒体 '+Path(archive_name).name,cancel=cancel,
+                done=0,total=len(wanted),bytes=0,bytes_total=sum(item['size'] for item in wanted.values()),scanned=0,
+                action='顺序扫描归档，等待目标成员') as stage, _open_tar(Path(archive_name)) as archive:
             for member in archive:
                 _check(cancel)
+                stage.add(scanned=1)
+                stage.update(position=member.offset,current=Path(member.name).name,current_bytes=0,current_total=member.size,
+                             action='扫描/跳过未引用成员，等待下一个目标')
                 item=wanted.get(member.name)
                 if not item:continue
+                stage.update(action='提取目标媒体并校验 SHA-256')
                 dest=output/item['export_path'];dest.parent.mkdir(parents=True,exist_ok=True)
                 partial=dest.with_name(dest.name+'.partial-'+uuid.uuid4().hex[:12])
                 h=hashlib.sha256();size=0
                 with archive.extractfile(member) as source,partial.open('xb') as target:
                     for block in iter(lambda:source.read(4*1024*1024),b''):
                         _check(cancel);h.update(block);size+=len(block);target.write(block)
+                        stage.add(bytes=len(block),current_bytes=len(block))
                 if size!=item['size'] or h.hexdigest()!=item['sha256']:
                     raise ExportError('微信附件提取校验失败：'+member.name)
                 partial.rename(dest)
                 mapping[item['sha256']]=item['export_path']
-        if any(item['sha256'] not in mapping for item in wanted.values()):
-            raise ExportError('备份中缺少已索引的微信附件，请重新扫描备份。')
+                stage.add(done=1)
+                stage.update(action='目标已校验并写入；继续扫描归档')
+            if any(item['sha256'] not in mapping for item in wanted.values()):
+                raise ExportError('备份中缺少已索引的微信附件，请重新扫描备份。')
     return mapping
 
 
@@ -498,13 +646,23 @@ def export_backup(source,output,work,*,timezone='Asia/Shanghai',progress=print,c
     for path,keys in _accounts(info,password=password,imei=imei,uin=uin):
         _check(cancel);uid=path.parent.name;directory=output/uid;directory.mkdir(exist_ok=True)
         progress('导出微信账号 '+uid[:8])
-        with open_account(path,work/'snapshots',keys,sqlcipher_module_path=sqlcipher_module_path) as db:
-            contacts={str(r.get('username') or ''):str(r.get('conRemark') or r.get('nickname') or r.get('username') or '') for r in _dict_rows(db,'rcontact')}
-            refs=_media_refs(db);count=0;missing=0;seen=set()
-            with (directory/'messages.jsonl').open('w',encoding='utf-8',newline='\n') as f:
+        with ExitStack() as resources:
+            with _StageProgress(progress,'准备微信账号 '+uid[:8],cancel=cancel,
+                    action='复制和解密数据库，等待数据库校验') as preparation:
+                db=resources.enter_context(open_account(path,work/'snapshots',keys,sqlcipher_module_path=sqlcipher_module_path))
+                _check(cancel);preparation.update(action='读取联系人')
+                contacts={str(r.get('username') or ''):str(r.get('conRemark') or r.get('nickname') or r.get('username') or '') for r in _dict_rows(db,'rcontact')}
+                _check(cancel);preparation.update(action='读取消息媒体引用')
+                refs=_media_refs(db);count=0;missing=0;seen=set()
+                _check(cancel);preparation.update(action='统计消息总数')
+                total=db.execute('SELECT COUNT(*) FROM message').fetchone()[0]
+                _check(cancel)
+            with _StageProgress(progress,'导出微信消息 '+uid[:8],cancel=cancel,unit='条',done=0,total=total,
+                    action='读取消息并匹配媒体引用') as stage, (directory/'messages.jsonl').open('w',encoding='utf-8',newline='\n') as f:
                 for raw in _dict_rows(db,'message'):
                     _check(cancel);key=source_key(raw)
-                    if key in seen:continue
+                    if key in seen:
+                        stage.add(done=1);continue
                     seen.add(key);mid=int(raw.get('msgId') or 0);talker=str(raw.get('talker') or '');own=raw.get('isSend')==1
                     text=str(raw.get('content') or '');sender=uid if own else talker
                     if talker.endswith('@chatroom') and not own and ':\n' in text:
@@ -533,7 +691,8 @@ def export_backup(source,output,work,*,timezone='Asia/Shanghai',progress=print,c
                                     'is_group':talker.endswith('@chatroom'),'local_media':local,
                                     'media_status':'available' if local else ('missing' if base in (3,34,43,47,49,62) else 'none')}}
                     f.write(_dump(rec)+'\n');count+=1
-                    if count%100000==0:progress(f'微信 {uid[:8]}：{count:,} 条')
+                    stage.add(done=1)
+                    stage.update(action=f'已写入 {count:,} 条去重消息，继续匹配媒体引用')
             stats={'app':'WeChat','account_uid':uid,'nickname':'微信 · '+uid[:8],'message_count':count,'media_missing_messages':missing}
             (directory/'statistics.json').write_text(_dump(stats),encoding='utf-8')
             (directory/'contacts.json').write_text(_dump([{'user_id':k,'nickname':v} for k,v in contacts.items()]),encoding='utf-8')
@@ -543,19 +702,24 @@ def export_backup(source,output,work,*,timezone='Asia/Shanghai',progress=print,c
     playback,warnings=_playable_audio(list(used.values()),media_output or output,work,progress,cancel)
     playback.update(previews);warnings+=image_warnings
     if playback:
-        for stats in results:
-            directory=output/stats['account_uid'];original=directory/'messages.jsonl';saved=directory/'messages.before-audio.jsonl'
-            original.rename(saved)
-            with saved.open(encoding='utf-8') as inp,original.open('x',encoding='utf-8',newline='\n') as out:
-                for line in inp:
-                    row=json.loads(line);meta=row['_export'];paths=meta['local_media']
-                    originals=[p for p in paths if p in playback]
-                    if originals:
-                        meta['original_media']=originals
-                        meta['local_media']=[playback.get(p,p) for p in paths]
-                        if any(p in previews for p in originals):
-                            meta['image_previews']=[previews[p] for p in originals if p in previews]
-                    out.write(_dump(row)+'\n')
+        with _StageProgress(progress,'更新微信消息媒体引用',cancel=cancel,unit='条',done=0,
+                total=sum(stats['message_count'] for stats in results)) as stage:
+            for stats in results:
+                _check(cancel)
+                directory=output/stats['account_uid'];original=directory/'messages.jsonl';saved=directory/'messages.before-audio.jsonl'
+                stage.update(current=stats['account_uid'][:8],action='保留原消息文件并写入播放引用')
+                original.rename(saved)
+                with saved.open(encoding='utf-8') as inp,original.open('x',encoding='utf-8',newline='\n') as out:
+                    for line in inp:
+                        _check(cancel)
+                        row=json.loads(line);meta=row['_export'];paths=meta['local_media']
+                        originals=[p for p in paths if p in playback]
+                        if originals:
+                            meta['original_media']=originals
+                            meta['local_media']=[playback.get(p,p) for p in paths]
+                            if any(p in previews for p in originals):
+                                meta['image_previews']=[previews[p] for p in originals if p in previews]
+                        out.write(_dump(row)+'\n');stage.add(done=1)
     summary={'app':'WeChat','timezone':timezone,'accounts':results,'media_assets':len(used),'status':'completed','warnings':warnings}
     (output/'export_summary.json').write_text(_dump(summary),encoding='utf-8')
     return {'status':'completed','app':'wechat','output':str(output),'summary':summary,

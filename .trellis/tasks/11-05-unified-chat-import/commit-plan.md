@@ -109,3 +109,36 @@ unified-import specification, GUI/import/testing docs and this task's updated
 artifacts. Existing approval covers commit and push. Original backups, live
 libraries, runtime logs and private URLs remain excluded. The running GUI is
 not restarted for this logging-only correction.
+
+## Follow-up: fix(import): report stage progress and close owned readers
+
+Existing explicit authorization covers commit and push to origin/master.
+This single coherent change includes phase-aware logs/numeric GUI progress,
+live reader merge output, reserved reader-port avoidance and owned-reader
+shutdown on GUI close, with regression tests and documentation.
+
+Include only these reviewed paths:
+
+- `src/duoshan_export/progress.py`
+- `src/duoshan_export/apps/wechat.py`
+- `src/duoshan_export/library.py`
+- `src/duoshan_export/library_media.py`
+- `src/duoshan_export/gui.py`
+- `tests/test_progress.py`
+- `tests/test_wechat.py`
+- `tests/test_library.py`
+- `tests/test_library_media.py`
+- `tests/test_gui.py`
+- `web/server/library-import.mjs`
+- `web/tests/library-import.test.mjs`
+- `docs/gui.md`
+- `docs/unified-import.md`
+- `.trellis/spec/backend/unified-import.md`
+- `.trellis/spec/backend/web-reader.md`
+- This task's `prd.md`, `design.md`, `implement.md`, `task.json`,
+  `verification.md`, and `commit-plan.md`.
+
+No unrecognized dirty files were present. Private backups, live libraries,
+settings and all external QA artifacts stay excluded. No cleanup, automatic
+import or real GUI restart is part of this commit. Task completion is recorded
+in place; archive/finish commands are not run because they unlink session files.

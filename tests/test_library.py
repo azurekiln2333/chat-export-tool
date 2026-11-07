@@ -11,6 +11,7 @@ import sqlite3
 import sys
 import tarfile
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -18,7 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from duoshan_export.errors import ExportError
 from duoshan_export.library import (discover_sources, inspect_sources, import_sources, import_history,
-    _source_signature, _prepare_reader_stage, _merge_manifest, _library_lock)
+    _source_signature, _prepare_reader_stage, _merge_manifest, _library_lock, _run_reader)
+from duoshan_export.progress import ProgressEvent
 
 
 class LibraryTests(unittest.TestCase):
@@ -78,6 +80,65 @@ class LibraryTests(unittest.TestCase):
         f.write_bytes(b"abd")
         os.utime(f, ns=(stat.st_atime_ns, stat.st_mtime_ns))
         self.assertNotEqual(before, _source_signature(p, lambda _: None))
+
+    def test_signature_progress_matches_original_digest_and_excludes_apk(self):
+        source = self.root / "source"
+        source.mkdir()
+        (source / "one.db").write_bytes(b"abc")
+        (source / "two.db").write_bytes(b"12345")
+        (source / "apk.tar.zst").write_bytes(b"excluded")
+        digest = hashlib.sha256(b"library-source-v1\n")
+        for name, data in (("one.db", b"abc"), ("two.db", b"12345")):
+            digest.update(name.encode() + b"\0" + str(len(data)).encode() + b"\0")
+            digest.update(hashlib.sha256(data).hexdigest().encode() + b"\n")
+        logs = []
+        self.assertEqual(_source_signature(source, logs.append), digest.hexdigest())
+        final = logs[-1]
+        self.assertEqual((final.completed, final.total, final.unit, final.state), (8, 8, "字节", "completed"))
+
+    def test_reader_preparation_reports_exact_bytes_and_preserves_bom_and_bigints(self):
+        uid = "9100000000000001"
+        row = self.message("unicode", text="中文😀")
+        source = self.export("source", "Duoshan", uid, [row])
+        messages = source / uid / "messages.jsonl"
+        raw = b"\xef\xbb\xbf" + messages.read_bytes().replace(b"\n", b"\r\n") + b"\r\n"
+        messages.write_bytes(raw)
+        logs = []
+        _prepare_reader_stage(source, self.root / "stage", self.root / "library", "duoshan", logs.append)
+        final = [event for event in logs if isinstance(event, ProgressEvent) and event.stage.startswith("准备阅读器记录")][-1]
+        self.assertEqual((final.completed, final.total, final.state), (len(raw), len(raw), "completed"))
+        self.assertEqual(json.loads((self.root / "stage" / uid / "messages.jsonl").read_text(encoding="utf-8")), row)
+        self.assertEqual(messages.read_bytes(), raw)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for bridge integration")
+    def test_reader_events_stream_before_exit_and_heartbeat_during_wait(self):
+        script = self.root / "progress.mjs"
+        script.write_text('''
+process.stderr.write('CHAT_ARCHIVE_PROGRESS '+JSON.stringify({message:'合并记录',stage:'合并记录',completed:2,total:7,unit:'条',state:'running'})+'\\n');
+setTimeout(() => process.stdout.write(JSON.stringify({status:'completed'})), 150);
+''', encoding="utf-8")
+        logs = []
+        with patch("duoshan_export.library._node_command", return_value=(shutil.which("node"), script)), patch("duoshan_export.library.READER_PROGRESS_INTERVAL", 0.02):
+            result = _run_reader("node", [], logs.append)
+        self.assertEqual(result["status"], "completed")
+        heartbeats = [event for event in logs if "仍在处理" in event and event.stage == "合并记录"]
+        self.assertTrue(heartbeats)
+        self.assertTrue(all((event.completed, event.total) == (2, 7) for event in heartbeats))
+        self.assertEqual(logs[-1].state, "completed")
+        self.assertFalse(any(t.name.startswith("reader-import-") for t in threading.enumerate()))
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for bridge integration")
+    def test_invalid_reader_result_never_reports_merge_complete(self):
+        script = self.root / "invalid.mjs"
+        for output in ("invalid json", "null", "[]", '{"status":"error"}'):
+            with self.subTest(output=output):
+                script.write_text("process.stdout.write(" + json.dumps(output) + ");", encoding="utf-8")
+                logs = []
+                with patch("duoshan_export.library._node_command", return_value=(shutil.which("node"), script)):
+                    with self.assertRaisesRegex(ExportError, "invalid result"):
+                        _run_reader("node", [], logs.append)
+                self.assertFalse(any(getattr(event, "state", None) == "completed" for event in logs))
+                self.assertEqual(logs[-1].state, "failed")
 
     def test_selected_package_and_nested_sources_are_protected_before_discovery(self):
         package = self.root / "backup" / "com.tencent.mm"

@@ -139,3 +139,59 @@ stdout and arbitrary errors continue credential redaction. Original data and
 live libraries are unchanged. No Node or media acquisition behavior was changed.
 
 Final Qt run: 17/17 passed, including signed queries containing synthetic credential values and safe handling of surrounding text/stdout/errors. Legacy Windows redirected console output falls back to ASCII status markers if its encoding cannot print a checkmark; ASCII signed URLs remain unchanged.
+
+## Observable import progress and owned-reader shutdown (2026-11-07)
+
+Read-only diagnosis found that the apparently stuck WeChat extraction had
+advanced into playback conversion. The inspected run later recorded
+cancellation before reader merging. Completed attachments and retained working
+files were present; the destination did not yet have a reader database. No
+agent stopped or restarted that live import. No original backup was modified.
+
+Added string-compatible structured phase progress across source hashing,
+WeChat preparation/export/media extraction/conversion/reference rewriting,
+reader preparation and streamed Node merging/projection. Known totals drive
+both GUI progress bars; unknown totals remain indeterminate. Bounded reporters
+emit five-second liveness during disk/codec waits and stop before phase exit.
+Media inventory, validation, downloads and metadata patching also identify their
+current phase. Full per-resource URL logs retain the existing behavior.
+
+New ports and probe binds exclude 64967–65066 inclusive. Closing the GUI
+requests task cancellation and closes only its owned reader handle, waiting
+asynchronously and reporting shutdown errors without closing prematurely.
+Reentrant starts are disabled while closing. Browser tabs are not closed.
+
+Verification observed:
+
+- WeChat targeted suite: 27/27, including synthetic SQLCipher/WAL, raw values,
+  actual SILK/WXGF decoding, archive skips, real counters, blocked preparation,
+  corruption, cancellation and reporter lifecycle.
+- Library/progress targeted suite: 17/17, including independent hash
+  compatibility, BOM/CRLF/unsafe-integer preservation, streamed subprocess
+  events, liveness during waits and rejection of invalid successful results.
+- Full Python suite: 232 cases, 212 passed and 20 optional Qt skips in the
+  backend environment. All Qt controls were separately exercised: 26/26 passed.
+- Final media-stage additions: 39/39 targeted media tests passed, including
+  selected-account totals and heartbeat during metadata-patch waits.
+- Production reader build passed with `--emptyOutDir false`; full Node suite:
+  165/165 passed, including import transaction/projection recovery and the
+  unchanged other-app reader behavior.
+- `compileall`, `git diff --check` and backend doctor passed. Doctor confirmed
+  core, encrypted-database and audio-conversion dependencies available.
+- An isolated offscreen Qt window showed 1,234/5,000 files and 24%; the render
+  was visually inspected. An actual Node reader on a synthetic library exited
+  when that GUI closed. Windows termination is not claimed as graceful SIGTERM.
+
+External QA artifacts (no private chat data or signed URLs in this commit):
+
+- D:/AppData/Local/Temp/chat-progress-python-20261107-084338.log
+- D:/AppData/Local/Temp/chat-progress-node-20261107-084038.log
+- D:/AppData/Local/Temp/wechat-stage-preparation-final-20261107.log
+- D:/ChatImportWork/gui-progress-lifecycle-qa-tlb9_33u/results.json
+- D:/ChatImportWork/gui-progress-lifecycle-qa-tlb9_33u/stage-progress.png
+
+Limits: codec cancellation may wait for the existing 60/120-second per-file
+timeout, with continuing progress logs. Retrying a cancelled import creates a
+new run and reuses verified final attachments; scan/conversion work is not a
+full checkpoint resume. No real import/download or user GUI restart was used
+for QA. All task evidence remains in place under workspace retention rules.

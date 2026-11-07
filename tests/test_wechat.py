@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import base64
-from contextlib import closing, redirect_stderr, redirect_stdout
+from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
 import hashlib
 import io
 import json
@@ -14,7 +14,10 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
+import time
 import unittest
+from unittest.mock import Mock, patch
 import wave
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +25,8 @@ sys.path.insert(0, str(ROOT / "src"))
 from duoshan_export.apps import wechat
 from duoshan_export.errors import ExportError
 from duoshan_export.library import import_sources
+from duoshan_export.progress import ProgressEvent
+from tests.synthetic import png_bytes, wav_bytes
 
 try:
     import sqlcipher3
@@ -107,6 +112,233 @@ class WeChatTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(value)
         return path
+
+    def test_stage_heartbeat_has_truthful_counts_and_stops_before_final_event(self):
+        events=[]; heartbeat=threading.Event()
+        def record(event):
+            events.append(event)
+            if '进行中' in event:heartbeat.set()
+        with patch.object(wechat,'PROGRESS_INTERVAL',0.01):
+            with wechat._StageProgress(record,'测试等待',done=0,total=2) as stage:
+                stage.update(action='等待阻塞读取')
+                self.assertTrue(heartbeat.wait(2))
+                self.assertEqual(events[-1].completed,0)
+                stage.add(done=2)
+            self.assertFalse(stage.thread.is_alive())
+            self.assertEqual(events[-1].state,'completed')
+            self.assertEqual((events[-1].completed,events[-1].total),(2,2))
+            count=len(events)
+            time.sleep(0.04)
+            self.assertEqual(len(events),count)
+        self.assertTrue(all(isinstance(event,ProgressEvent) for event in events))
+
+    def test_stage_heartbeat_preserves_callback_error_cancel_and_processing_error(self):
+        error=RuntimeError('synthetic callback failure'); called=threading.Event()
+        def fail(event):
+            if '进行中' in event:
+                called.set();raise error
+        with patch.object(wechat,'PROGRESS_INTERVAL',0.01):
+            with self.assertRaises(RuntimeError) as raised:
+                with wechat._StageProgress(fail,'callback',done=0,total=1) as stage:
+                    self.assertTrue(called.wait(2))
+            self.assertIs(raised.exception,error)
+            self.assertFalse(stage.thread.is_alive())
+        for cancelled in (False,True):
+            events=[]; original=ExportError('original processing error')
+            with self.assertRaises(ExportError) as raised:
+                with wechat._StageProgress(events.append,'异常阶段',done=0,total=1,cancel=lambda:cancelled) as stage:
+                    raise original
+            self.assertIs(raised.exception,original)
+            self.assertFalse(stage.thread.is_alive())
+            self.assertEqual(events[-1].state,'cancelled' if cancelled else 'failed')
+            self.assertNotIn('完成',events[-1])
+
+    def test_account_preparation_heartbeat_ends_before_counted_message_export(self):
+        uid,_=self.make_account([message(1)])
+        observed=threading.Event();events=[];open_account=wechat.open_account
+        def record(event):
+            events.append(event)
+            if isinstance(event,ProgressEvent) and event.stage.startswith('准备微信账号') and '进行中' in event:
+                observed.set()
+        @contextmanager
+        def slow_open(*args,**kwargs):
+            self.assertTrue(observed.wait(2),'account snapshot/decryption must report its blocking wait')
+            with open_account(*args,**kwargs) as db:yield db
+        with patch.object(wechat,'PROGRESS_INTERVAL',0.01),patch.object(wechat,'open_account',side_effect=slow_open):
+            wechat.export_backup(self.source,self.output,self.work,progress=record)
+        prepared=[e for e in events if isinstance(e,ProgressEvent) and e.stage.startswith('准备微信账号')]
+        self.assertTrue(all(e.completed is None and e.total is None for e in prepared))
+        self.assertIn('复制和解密数据库',next(e for e in prepared if '进行中' in e))
+        self.assertEqual(prepared[-1].state,'completed')
+        first_export=next(i for i,e in enumerate(events) if isinstance(e,ProgressEvent) and e.stage.startswith('导出微信消息'))
+        self.assertTrue(all(not (isinstance(e,ProgressEvent) and e.stage.startswith('准备微信账号')) for e in events[first_export:]))
+        self.assertEqual((events[first_export].completed,events[first_export].total),(0,1))
+        self.assertEqual(self.rows(uid)[0]['_wechat_raw']['msgId'],1)
+
+    def test_invalid_metadata_cache_reports_failed_verification_before_fallback(self):
+        cache=self.root/'cache';cache.mkdir()
+        data=cache/'database.db';data.write_bytes(b'corrupted')
+        manifest=cache/'database-scan.json'
+        manifest.write_text(json.dumps({'metadata':[{'path':'database.db','sha256':hashlib.sha256(b'original').hexdigest()}]}))
+        events=[]
+        self.assertIsNone(wechat._cached_metadata(cache,manifest,progress=events.append))
+        self.assertEqual((events[-1].completed,events[-1].total,events[-1].state),(0,1,'failed'))
+        self.assertIn('失败 1',events[-1])
+        self.assertEqual(data.read_bytes(),b'corrupted')
+
+    def test_archive_skip_heartbeat_reports_member_position_and_exact_extraction_totals(self):
+        data=b'\xff\xd8\xffsynthetic'; digest=hashlib.sha256(data).hexdigest()
+        item={'archive':str(self.root/'fixture.tar.zst'),'member':'MicroMsg/image2/wanted',
+              'size':len(data),'sha256':digest,'category':'images','ext':'.jpg'}
+        observed=threading.Event();events=[]
+        def record(event):
+            events.append(event)
+            if event.stage.startswith('提取已引用') and '进行中' in event and '已见成员 1' in event:
+                observed.set()
+        class Archive:
+            def __iter__(archive):
+                skipped=tarfile.TarInfo('unrelated-large-member');skipped.size=8192;skipped.offset=4096
+                yield skipped
+                self.assertTrue(observed.wait(2),'heartbeat must run while archive skips to next wanted member')
+                wanted=tarfile.TarInfo(item['member']);wanted.size=len(data);wanted.offset=12800
+                yield wanted
+            def extractfile(archive, member):return io.BytesIO(data)
+        @contextmanager
+        def open_archive(_):yield Archive()
+        with patch.object(wechat,'PROGRESS_INTERVAL',0.01),patch.object(wechat,'_open_tar',side_effect=open_archive):
+            wechat._write_media([item],self.output,self.work,progress=record)
+        heartbeat=next(e for e in events if e.stage.startswith('提取已引用') and '进行中' in e)
+        self.assertEqual((heartbeat.completed,heartbeat.total),(0,1))
+        self.assertIn('最近成员起始位置 4,096 字节',heartbeat)
+        last=events[-1]
+        self.assertEqual((last.completed,last.total,last.state),(1,1,'completed'))
+        self.assertIn(f'已处理字节 {len(data)}/{len(data)}',last)
+        self.assertEqual((self.output/item['export_path']).read_bytes(),data)
+
+    def test_existing_media_hash_wait_is_observable_and_reuse_is_verified(self):
+        data=b'original media';digest=hashlib.sha256(data).hexdigest()
+        item={'size':len(data),'sha256':digest,'category':'files','ext':'.bin'}
+        target=self.output/f'attachments/wechat/files/{digest}.bin'
+        target.parent.mkdir(parents=True);target.write_bytes(data)
+        seen=threading.Event();events=[];actual_open=Path.open
+        def record(event):
+            events.append(event)
+            if '进行中' in event and '校验已有附件' in event:seen.set()
+        class SlowReader:
+            def __enter__(reader):
+                reader.stream=actual_open(target,'rb');reader.waited=False;return reader
+            def read(reader,size):
+                if not reader.waited:
+                    reader.waited=True;self.assertTrue(seen.wait(2))
+                return reader.stream.read(size)
+            def __exit__(reader,*args):reader.stream.close()
+        def open_file(path,*args,**kwargs):
+            return SlowReader() if path==target and args==('rb',) else actual_open(path,*args,**kwargs)
+        with patch.object(wechat,'PROGRESS_INTERVAL',0.01),patch.object(Path,'open',open_file):
+            wechat._write_media([item],self.output,self.work,progress=record)
+        self.assertIn('复用 1',events[-1])
+        self.assertEqual((events[-1].completed,events[-1].total),(1,1))
+        self.assertEqual(target.read_bytes(),data)
+
+    def test_conversion_waits_report_real_counts_reuse_and_failure_without_changing_originals(self):
+        cases=[('.wxgf','images',wechat._playable_images,png_bytes(),'等待 FFmpeg 图片转换'),
+               ('.amr','audio',wechat._playable_audio,wav_bytes(),'等待 FFmpeg AMR 语音转换')]
+        for ext,category,convert,playable,waiting in cases:
+            original=b'original '+ext.encode();digest=hashlib.sha256(original).hexdigest()
+            relative=f'attachments/wechat/{category}/{digest}{ext}'
+            source=self.output/relative;source.parent.mkdir(parents=True,exist_ok=True);source.write_bytes(original)
+            item={'sha256':digest,'ext':ext,'category':category,'size':len(original),'export_path':relative}
+            events=[];seen=threading.Event()
+            def record(event):
+                events.append(event)
+                if '进行中' in event and waiting in event:seen.set()
+            def run(command,**kwargs):
+                self.assertTrue(seen.wait(2),'decoder wait must keep progress observable')
+                Path(command[-1]).write_bytes(playable)
+                return subprocess.CompletedProcess(command,0)
+            with patch.object(wechat,'PROGRESS_INTERVAL',0.01),patch.object(wechat.subprocess,'run',side_effect=run):
+                replacement,warnings=convert([item],self.output,self.work,record)
+            self.assertEqual(warnings,[])
+            self.assertEqual((events[-1].completed,events[-1].total),(1,1))
+            self.assertIn('新转换 1',events[-1])
+            self.assertTrue(any(e.completed==0 and waiting in e for e in events))
+            events=[]
+            with patch.object(wechat.subprocess,'run',side_effect=AssertionError('valid cached playback must be reused')):
+                again,warnings=convert([item],self.output,self.work,events.append)
+            self.assertEqual(again,replacement);self.assertIn('复用 1',events[-1])
+            self.assertEqual(source.read_bytes(),original)
+            failed_item=dict(item,sha256=digest+'-failed')
+            events=[]
+            with patch.object(wechat.subprocess,'run',return_value=subprocess.CompletedProcess([],1)):
+                failed,warnings=convert([failed_item],self.output,self.work,events.append)
+            self.assertEqual(failed,{})
+            self.assertTrue(warnings);self.assertIn('失败 1',events[-1])
+            self.assertEqual((events[-1].completed,events[-1].total),(1,1))
+            self.assertEqual(source.read_bytes(),original)
+
+    def test_silk_response_wait_has_heartbeat_before_decoder_returns(self):
+        original=b'#!SILK_V3synthetic';digest=hashlib.sha256(original).hexdigest()
+        relative=f'attachments/wechat/audio/{digest}.silk'
+        source=self.output/relative;source.parent.mkdir(parents=True);source.write_bytes(original)
+        item={'sha256':digest,'ext':'.silk','category':'audio','size':len(original),'export_path':relative}
+        seen=threading.Event();events=[]
+        def record(event):
+            events.append(event)
+            if '进行中' in event and '等待 SILK 语音解码' in event:seen.set()
+        process=Mock(stdin=io.StringIO(),stdout=io.StringIO(''))
+        process.wait.return_value=0
+        class Inbox:
+            def put(inbox,value):pass
+            def get(inbox,timeout):
+                self.assertEqual(timeout,60)
+                self.assertTrue(seen.wait(2),'SILK response wait must report current stage')
+                request=json.loads(process.stdin.getvalue())
+                Path(request['output']).write_bytes(wav_bytes())
+                return '{"ok":true}'
+        with patch.object(wechat,'PROGRESS_INTERVAL',0.01),patch.object(wechat.subprocess,'Popen',return_value=process),patch.object(wechat.queue,'Queue',return_value=Inbox()):
+            playback,warnings=wechat._playable_audio([item],self.output,self.work,record)
+        self.assertEqual(warnings,[]);self.assertEqual(len(playback),1)
+        self.assertTrue(process.stdin.closed);self.assertTrue(process.stdout.closed)
+        process.wait.assert_called_once_with(timeout=5)
+        self.assertTrue(any(e.completed==0 and '等待 SILK 语音解码' in e for e in events))
+        self.assertEqual((events[-1].completed,events[-1].total,events[-1].state),(1,1,'completed'))
+        self.assertEqual(source.read_bytes(),original)
+
+    def test_message_export_and_reference_rewrite_emit_real_totals_and_preserve_raw_rows(self):
+        uid,_=self.make_account([message(1,type=3,imgPath='picture'),message(2)])
+        image=self.media(uid,'image2/picture',b'\xff\xd8\xfforiginal')
+        original=image.read_bytes();before=tree_hashes(self.source)
+        events=[]
+        def previews(items,output,work,progress,cancel=None):
+            target=Path(output)/'attachments/wechat/images/preview.png'
+            target.write_bytes(png_bytes())
+            return {items[0]['export_path']:'attachments/wechat/images/preview.png'},[]
+        with patch.object(wechat,'_playable_images',side_effect=previews):
+            wechat.export_backup(self.source,self.output,self.work,progress=events.append)
+        export=next(e for e in events if isinstance(e,ProgressEvent) and e.stage.startswith('导出微信消息') and e.state=='completed')
+        rewrite=next(e for e in events if isinstance(e,ProgressEvent) and e.stage=='更新微信消息媒体引用' and e.state=='completed')
+        self.assertEqual((export.completed,export.total,export.unit),(2,2,'条'))
+        self.assertEqual((rewrite.completed,rewrite.total,rewrite.unit),(2,2,'条'))
+        rows=self.rows(uid);self.assertEqual([r['_wechat_raw']['msgId'] for r in rows],[1,2])
+        self.assertEqual((self.output/rows[0]['_export']['original_media'][0]).read_bytes(),original)
+        self.assertEqual(tree_hashes(self.source),before)
+
+    def test_cancel_during_reference_rewrite_retains_full_previous_messages_and_no_success_event(self):
+        uid,_=self.make_account([message(1,type=3,imgPath='picture'),message(2)])
+        self.media(uid,'image2/picture',b'\xff\xd8\xfforiginal')
+        cancelled=threading.Event();events=[]
+        def progress(event):
+            events.append(event)
+            if isinstance(event,ProgressEvent) and event.stage=='更新微信消息媒体引用' and '开始' in event:
+                cancelled.set()
+        def previews(items,*args,**kwargs):return {items[0]['export_path']:'attachments/wechat/images/preview.png'},[]
+        with patch.object(wechat,'_playable_images',side_effect=previews):
+            with self.assertRaisesRegex(ExportError,'取消'):
+                wechat.export_backup(self.source,self.output,self.work,progress=progress,cancel=cancelled.is_set)
+        self.assertEqual(len(self.rows(uid)),2)
+        ending=events[-1]
+        self.assertEqual((ending.stage,ending.state),('更新微信消息媒体引用','cancelled'))
+        self.assertFalse(any(e.state=='completed' for e in events if isinstance(e,ProgressEvent) and e.stage==ending.stage))
 
     def test_plaintext_direction_group_raw_values_and_unknown_type(self):
         originals = [message(1, isSend=1), message(2),

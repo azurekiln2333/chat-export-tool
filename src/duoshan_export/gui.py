@@ -12,6 +12,7 @@ import io
 import json
 import os
 from pathlib import Path
+import secrets
 import shutil
 import socket
 import sqlite3
@@ -21,9 +22,27 @@ import threading
 import time
 import urllib.request
 
+from .progress import ProgressEvent
+
 APP_TITLE = "Chat Archive"
 APP_NAMES = {"wechat": "微信", "xhs": "小红书", "duoshan": "多闪/抖音"}
 GUI_HINT = "桌面界面需要 PyQt6 与 PyQt6-Fluent-Widgets。请在工具环境运行：pip install \".[gui]\""
+
+
+def reader_port_allowed(port: int) -> bool:
+    return 0 < port <= 65535 and not 64967 <= port <= 65066
+
+
+def available_reader_port() -> int:
+    for _ in range(64):
+        port = 49152 + secrets.randbelow(64967 - 49152)
+        with socket.socket() as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
+    raise OSError("未能找到允许使用的阅读器端口，请稍后重试。")
 
 
 def settings_path() -> Path:
@@ -379,6 +398,7 @@ def create_window(*, sources=(), output=None, work=None):
 
     class Worker(QThread):
         log = pyqtSignal(str)
+        stage_progress = pyqtSignal(object)
         succeeded = pyqtSignal(object)
         failed = pyqtSignal(str)
 
@@ -404,10 +424,16 @@ def create_window(*, sources=(), output=None, work=None):
 
         def _emit_log(self, value):
             self.log.emit(self._redact(str(value)))
+            if isinstance(value, ProgressEvent):
+                self.stage_progress.emit({"stage": self._redact(value.stage), "completed": value.completed,
+                    "total": value.total, "unit": self._redact(value.unit), "state": value.state})
 
         def _emit_media_log(self, value):
             # Only the download service's explicit resource-result callback may
             # preserve URLs. Stdout, errors and all surrounding text stay redacted.
+            if isinstance(value, ProgressEvent):
+                self._emit_log(value)
+                return
             text = str(value)
             head, separator, detail = text.partition(" | ")
             marker, url = head[:3], head[3:]
@@ -470,6 +496,8 @@ def create_window(*, sources=(), output=None, work=None):
             self.details_dialog = None
             self._details_buttons = []
             self.last_result = None
+            self.last_stage = None
+            self.close_requested = False
             self.media_result_output = None
             self.reader_process = None
             self.reader_url = ""
@@ -486,6 +514,11 @@ def create_window(*, sources=(), output=None, work=None):
             self.reader_switch_timer.timeout.connect(self._check_reader_switch)
             self.reader_pending_options = None
             self.reader_switch_started = 0.0
+            self.reader_close_timer = QTimer(self)
+            self.reader_close_timer.setInterval(100)
+            self.reader_close_timer.timeout.connect(self._check_reader_close)
+            self.reader_close_started = 0.0
+            self.reader_close_forced = False
             self._busy_controls = []
             self.import_page = self._page("import", "导入聊天备份", "微信、多闪、小红书，汇总到一个可持续更新的聊天资料库。")
             self.library_page = self._page("library", "我的聊天资料库", "查看合并结果，打开阅读器，继续追加新的备份。")
@@ -626,6 +659,10 @@ def create_window(*, sources=(), output=None, work=None):
             self.progress.setRange(0, 100)
             self.progress.setValue(0)
             layout.addWidget(self.progress)
+            self.progress_stage_label = BodyLabel("尚未开始", card)
+            self.progress_stage_label.setTextFormat(Qt.TextFormat.PlainText)
+            self.progress_stage_label.setWordWrap(True)
+            layout.addWidget(self.progress_stage_label)
             self.status_label = BodyLabel("准备就绪", card)
             self.status_label.setTextFormat(Qt.TextFormat.PlainText)
             self.status_label.setWordWrap(True)
@@ -701,6 +738,10 @@ def create_window(*, sources=(), output=None, work=None):
             self.history_progress.setRange(0, 100)
             self.history_progress.setValue(0)
             layout.addWidget(self.history_progress)
+            self.history_stage_label = BodyLabel("尚未开始", card)
+            self.history_stage_label.setTextFormat(Qt.TextFormat.PlainText)
+            self.history_stage_label.setWordWrap(True)
+            layout.addWidget(self.history_stage_label)
             self.history_status = BodyLabel("准备就绪", card)
             self.history_status.setTextFormat(Qt.TextFormat.PlainText)
             self.history_status.setWordWrap(True)
@@ -819,6 +860,8 @@ def create_window(*, sources=(), output=None, work=None):
                     self._library_output_changed()
 
         def _choose_library(self):
+            if self.close_requested:
+                return
             value = QFileDialog.getExistingDirectory(self, "选择聊天资料库", self.output_edit.text())
             if not value:
                 return
@@ -830,6 +873,8 @@ def create_window(*, sources=(), output=None, work=None):
             self._library_output_changed()
 
         def _library_output_changed(self):
+            if self.close_requested:
+                return
             self._refresh_library()
             if not self.output_edit.text().strip():
                 return
@@ -896,6 +941,8 @@ def create_window(*, sources=(), output=None, work=None):
                 "download_media": self.download_check.isChecked()}
 
         def _view_media_details(self):
+            if self.close_requested:
+                return
             if self.details_worker is not None:
                 self.details_dialog.show()
                 self.details_dialog.raise_()
@@ -937,9 +984,10 @@ def create_window(*, sources=(), output=None, work=None):
                 self.details_dialog.refresh_button.setEnabled(True)
             if worker is not None:
                 worker.deleteLater()
+            self._continue_close()
 
         def _start(self, operation):
-            if self.worker is not None:
+            if self.close_requested or self.worker is not None:
                 return
             if operation != "download" and not self.sources:
                 self._error("请先添加至少一个备份目录或文件。")
@@ -966,6 +1014,7 @@ def create_window(*, sources=(), output=None, work=None):
             worker = Worker(operation, () if operation == "download" else self.sources, options, self)
             self.worker = worker
             worker.log.connect(self._log)
+            worker.stage_progress.connect(self._show_stage_progress)
             worker.succeeded.connect(lambda result: self._completed(operation, result))
             worker.failed.connect(self._failed)
             worker.finished.connect(self._worker_finished)
@@ -977,19 +1026,65 @@ def create_window(*, sources=(), output=None, work=None):
 
         def _set_busy(self, busy):
             for control in self._busy_controls:
-                control.setEnabled(not busy)
+                control.setEnabled(not busy and not self.close_requested)
             self.cancel_button.setEnabled(busy)
             self.history_cancel_button.setEnabled(busy)
             self.progress.setRange(0, 0 if busy else 100)
             self.history_progress.setRange(0, 0 if busy else 100)
-            if not busy:
+            if busy:
+                self.last_stage = None
+                self.progress_stage_label.setText("任务进行中，等待阶段进度……")
+                self.history_stage_label.setText(self.progress_stage_label.text())
+            else:
                 self._sync_reader_controls()
-                completed = isinstance(self.last_result, dict) and self.last_result.get("status") not in ("error", "cancelled")
-                self.progress.setValue(100 if completed else 0)
-                self.history_progress.setValue(100 if completed else 0)
+                status = self.last_result.get("status", "completed") if isinstance(self.last_result, dict) else "error"
+                completed = status in ("completed", "inspected", "success", "ok")
+                stopped = status in ("cancelled", "canceled", "stopped")
+                caption = "任务完成" if completed else "任务已停止" if stopped else "任务未完成"
+                value = 100 if completed else 0
+                if not completed and self.last_stage:
+                    final_stage = dict(self.last_stage)
+                    if final_stage["state"] == "running":
+                        final_stage["state"] = "cancelled" if stopped else "failed"
+                    caption += " · " + self._stage_caption(final_stage)
+                    total, done = self.last_stage["total"], self.last_stage["completed"]
+                    if total and done is not None:
+                        value = min(100, done * 100 // total)
+                for bar in (self.progress, self.history_progress):
+                    bar.setValue(value)
+                for label in (self.progress_stage_label, self.history_stage_label):
+                    label.setText(caption)
+
+        def _stage_caption(self, event):
+            done, total = event["completed"], event["total"]
+            state = {"running": "进行中", "completed": "本阶段完成", "failed": "本阶段失败", "cancelled": "本阶段已停止"}[event["state"]]
+            caption = f"当前阶段：{event['stage']} · {state}"
+            if done is not None and total is not None:
+                caption += f" · {done:,}/{total:,} {event['unit']}"
+                if total > 0:
+                    caption += f" · {min(100, done * 100 // total)}%"
+            elif done is not None:
+                caption += f" · 已处理 {done:,} {event['unit']}（总量未知）"
+            else:
+                caption += " · 总量未知"
+            return caption
+
+        def _show_stage_progress(self, event):
+            self.last_stage = event
+            total, done = event["total"], event["completed"]
+            known = total is not None and total > 0 and done is not None
+            waiting = event["state"] == "running" and not known
+            value = min(100, done * 100 // total) if known else 100 if event["state"] == "completed" else 0
+            for bar in (self.progress, self.history_progress):
+                bar.setRange(0, 0 if waiting else 100)
+                if not waiting:
+                    bar.setValue(value)
+            caption = self._stage_caption(event)
+            for label in (self.progress_stage_label, self.history_stage_label):
+                label.setText(caption)
 
         def _sync_reader_controls(self):
-            enabled = self.worker is None and not self.reader_timer.isActive() and not self.reader_switch_timer.isActive()
+            enabled = not self.close_requested and self.worker is None and not self.reader_timer.isActive() and not self.reader_switch_timer.isActive()
             self.reader_button.setEnabled(enabled)
             self.reader_reload_button.setEnabled(enabled)
 
@@ -1047,6 +1142,7 @@ def create_window(*, sources=(), output=None, work=None):
             self._set_busy(False)
             if worker is not None:
                 worker.deleteLater()
+            self._continue_close()
 
         def _refresh_library(self):
             self.account_table.setRowCount(0)
@@ -1111,6 +1207,8 @@ def create_window(*, sources=(), output=None, work=None):
                 self._error("资料库目录尚不存在。完成第一次导入后再打开。")
 
         def _open_reader(self, *, reload=False):
+            if self.close_requested:
+                return
             try:
                 if not self.output_edit.text().strip():
                     raise ValueError("请先选择聊天资料库。")
@@ -1158,10 +1256,8 @@ def create_window(*, sources=(), output=None, work=None):
                 self._error(str(error))
 
         def _launch_reader(self, options, port=None):
-            if port is None:
-                with socket.socket() as probe:
-                    probe.bind(("127.0.0.1", 0))
-                    port = probe.getsockname()[1]
+            if port is None or not reader_port_allowed(port):
+                port = available_reader_port()
             output_path = options["output"]
             log_dir = output_path / "import_logs"
             log_dir.mkdir(parents=True, exist_ok=True)
@@ -1223,6 +1319,12 @@ def create_window(*, sources=(), output=None, work=None):
                 self.reader_status.setText(f"阅读器仍在启动。进度日志：{self.reader_log_path}。稍后再点击打开。")
 
         def closeEvent(self, event):
+            self.close_requested = True
+            for control in [*self._busy_controls, *self._details_buttons]:
+                control.setEnabled(False)
+            self.reader_timer.stop()
+            self.reader_switch_timer.stop()
+            self.reader_pending_options = None
             running = False
             if self.details_worker is not None and self.details_worker.isRunning():
                 self.details_worker.cancel_event.set()
@@ -1230,6 +1332,20 @@ def create_window(*, sources=(), output=None, work=None):
                 running = True
             if self.worker is not None and self.worker.isRunning():
                 self._cancel()
+                running = True
+            if self.reader_process is not None and self.reader_process.poll() is None:
+                if not self.reader_close_timer.isActive():
+                    try:
+                        self.reader_process.terminate()
+                    except OSError as error:
+                        self._close_failed()
+                        self._error(f"未能关闭本窗口启动的阅读器：{error}。请稍后再关闭窗口。")
+                        event.ignore()
+                        return
+                    self.reader_ready = False
+                    self.reader_close_started = time.monotonic()
+                    self.reader_close_forced = False
+                    self.reader_close_timer.start()
                 running = True
             if running:
                 event.ignore()
@@ -1241,8 +1357,47 @@ def create_window(*, sources=(), output=None, work=None):
             self.reader_timer.stop()
             self.reader_switch_timer.stop()
             self.reader_pending_options = None
-            # The reader is deliberately detached so an open browser stays usable.
+            self.reader_close_timer.stop()
             super().closeEvent(event)
+
+        def _check_reader_close(self):
+            if self.reader_process is None or self.reader_process.poll() is not None:
+                self.reader_close_timer.stop()
+                self._continue_close()
+                return
+            if time.monotonic() - self.reader_close_started > 10:
+                if not self.reader_close_forced:
+                    try:
+                        # Same owned handle only; no global Node/process-tree searches.
+                        self.reader_process.kill()
+                    except OSError as error:
+                        self.reader_close_timer.stop()
+                        self._close_failed()
+                        self._error(f"未能关闭本窗口启动的阅读器：{error}")
+                        return
+                    self.reader_close_forced = True
+                    self.reader_close_started = time.monotonic()
+                else:
+                    self.reader_close_timer.stop()
+                    self._close_failed()
+                    self._error("本窗口启动的阅读器尚未退出，请稍后再关闭窗口。")
+
+        def _close_failed(self):
+            self.close_requested = False
+            for control in self._busy_controls:
+                control.setEnabled(self.worker is None)
+            for control in self._details_buttons:
+                control.setEnabled(self.details_worker is None)
+            self._sync_reader_controls()
+
+        def _continue_close(self):
+            if not self.close_requested:
+                return
+            if self.worker is not None or self.details_worker is not None:
+                return
+            if self.reader_process is not None and self.reader_process.poll() is None:
+                return
+            QTimer.singleShot(0, self.close)
 
     return MainWindow()
 

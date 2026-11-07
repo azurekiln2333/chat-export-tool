@@ -14,16 +14,20 @@ import io
 import json
 import os
 from pathlib import Path
+import queue
 import re
 import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 from types import SimpleNamespace
 from typing import Callable, Iterable
 from uuid import uuid4
 
 from .errors import ExportError
+from .progress import ProgressEvent, StageReporter
 from .runtime import file_sha256
 
 PACKAGES = {"com.tencent.mm": "wechat", "my.maya.android": "duoshan", "com.xingin.xhs": "xhs"}
@@ -33,6 +37,15 @@ ACCOUNT_NAME = re.compile(r"^(?:(?:wx|xhs|dy)_)?(?:[0-9]+|[0-9a-f]{16,64})$")
 ARCHIVE_SUFFIXES = (".tar.zst", ".tar.gz", ".tar", ".tgz", ".tzst", ".zst")
 HISTORY = "import_history.jsonl"
 IMPORT_VERSION = 1
+READER_PROGRESS_INTERVAL = 5.0
+READER_PROGRESS_PREFIX = "CHAT_ARCHIVE_PROGRESS "
+READER_STAGE_LABELS = {
+    "reader-fingerprint": "校验阅读器导入文件",
+    "reader-organize": "整理阅读器账号目录",
+    "reader-merge": "合并阅读器消息（事务提交后生效）",
+    "reader-conversations": "更新阅读器会话统计",
+    "reader-project": "写出阅读器账号文件",
+}
 
 
 def _is_archive(path: Path) -> bool:
@@ -202,24 +215,33 @@ def _new_run(work: Path, app: str) -> Path:
 
 def _source_signature(source: Path, progress: Callable[[str], None], cancel=None) -> str:
     digest = hashlib.sha256(f"library-source-v{IMPORT_VERSION}\n".encode())
-    files = [source] if source.is_file() else sorted(p for p in source.rglob("*") if p.is_file())
-    for index, path in enumerate(files):
-        if path.name.lower().startswith(("apk.tar", "obb.tar")):
-            continue
-        _check_cancel(cancel)
-        if path.is_symlink():
-            raise ExportError(f"Source contains a symbolic link: {path}")
-        relative = path.name if source.is_file() else path.relative_to(source).as_posix()
-        digest.update(relative.encode("utf-8") + b"\0")
-        digest.update(str(path.stat().st_size).encode() + b"\0")
-        h = hashlib.sha256()
-        with path.open("rb") as stream:
-            for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
-                h.update(block)
-                _check_cancel(cancel)
-        digest.update(h.hexdigest().encode() + b"\n")
-        if index % 500 == 0 or path.stat().st_size > 100 * 1024 * 1024:
-            progress(f"已校验来源文件 {index + 1}/{len(files)}：{path.name}")
+    with StageReporter(progress, "枚举备份文件", completed=0, unit="个", cancel=cancel) as stage:
+        files = []
+        for path in ([source] if source.is_file() else source.rglob("*")):
+            _check_cancel(cancel)
+            if path.is_file() and not path.name.lower().startswith(("apk.tar", "obb.tar")):
+                if path.is_symlink():
+                    raise ExportError(f"Source contains a symbolic link: {path}")
+                files.append(path)
+                stage.update(completed=len(files))
+        files.sort()
+        total_bytes = sum(path.stat().st_size for path in files)
+    processed = 0
+    with StageReporter(progress, "校验备份内容", completed=0, total=total_bytes, unit="字节", cancel=cancel) as stage:
+        for index, path in enumerate(files):
+            _check_cancel(cancel)
+            relative = path.name if source.is_file() else path.relative_to(source).as_posix()
+            digest.update(relative.encode("utf-8") + b"\0")
+            digest.update(str(path.stat().st_size).encode() + b"\0")
+            stage.update(detail=f"文件 {index + 1:,}/{len(files):,}：{path.name}")
+            h = hashlib.sha256()
+            with path.open("rb") as stream:
+                for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+                    h.update(block)
+                    processed += len(block)
+                    stage.update(completed=processed)
+                    _check_cancel(cancel)
+            digest.update(h.hexdigest().encode() + b"\n")
     return digest.hexdigest()
 
 
@@ -441,22 +463,34 @@ def _prepare_reader_stage(source: Path, destination: Path, library: Path, app: s
     mapping = {}
     attached = source / "attachments"
     if attached.is_dir():
-        for index, path in enumerate(attached.rglob("*")):
-            if path.is_file():
+        with StageReporter(progress, "枚举待校验媒体", completed=0, cancel=cancel) as stage:
+            assets = []
+            for path in attached.rglob("*"):
                 _check_cancel(cancel)
+                if path.is_file():
+                    assets.append(path)
+                    stage.update(completed=len(assets))
+        with StageReporter(progress, "校验并准备阅读器媒体", completed=0, total=len(assets), cancel=cancel) as stage:
+            for index, path in enumerate(assets):
+                _check_cancel(cancel)
+                stage.update(detail=f"当前 {path.name}")
                 _copy_asset(source, library, app, mapping, path.relative_to(source).as_posix())
-                if index % 500 == 0:
-                    progress(f"已校验媒体文件：{len(mapping)}")
+                stage.update(completed=index + 1)
     manifests = {}
-    for name in ("media_manifest.json", "decoration_manifest.json"):
-        data = _read_json(source / name, {})
-        for relative in _media_references(data):
-            if relative not in mapping:
-                # Failed resource records can legitimately name an absent path.
-                if _contained_file(source, relative).is_file() or _contained_file(library, relative).is_file():
-                    _copy_asset(source, library, app, mapping, relative)
-        manifests[name] = _rewrite_paths(data, mapping)
-        (destination / name).write_text(json.dumps(manifests[name], ensure_ascii=False), encoding="utf-8")
+    with StageReporter(progress, "准备阅读器媒体清单", completed=0, total=2, unit="份", cancel=cancel) as stage:
+        for index, name in enumerate(("media_manifest.json", "decoration_manifest.json")):
+            _check_cancel(cancel)
+            stage.update(detail=f"当前 {name}")
+            data = _read_json(source / name, {})
+            for relative in _media_references(data):
+                _check_cancel(cancel)
+                if relative not in mapping:
+                    # Failed resource records can legitimately name an absent path.
+                    if _contained_file(source, relative).is_file() or _contained_file(library, relative).is_file():
+                        _copy_asset(source, library, app, mapping, relative)
+            manifests[name] = _rewrite_paths(data, mapping)
+            (destination / name).write_text(json.dumps(manifests[name], ensure_ascii=False), encoding="utf-8")
+            stage.update(completed=index + 1)
     for directory in sorted(source.iterdir()):
         messages = directory / "messages.jsonl"
         if not directory.is_dir() or not ACCOUNT_NAME.fullmatch(directory.name) or not messages.is_file():
@@ -466,22 +500,28 @@ def _prepare_reader_stage(source: Path, destination: Path, library: Path, app: s
         for name in ("statistics.json", "contacts.json"):
             if (directory / name).is_file():
                 shutil.copyfile(directory / name, target / name)
-        with messages.open(encoding="utf-8-sig") as inp, (target / "messages.jsonl").open("w", encoding="utf-8", newline="\n") as out:
-            for index, line in enumerate(inp):
-                if not line.strip():
-                    continue
-                row = json.loads(line)
-                if not isinstance(row, dict):
-                    raise ExportError(f"Invalid message object in {messages.name}, line {index + 1}")
-                meta = row.get("_export", {})
-                if isinstance(meta, dict):
-                    for relative in _media_references(meta):
-                        if relative not in mapping:
-                            _copy_asset(source, library, app, mapping, relative)
-                    row["_export"] = _rewrite_paths(meta, mapping)
-                out.write(json.dumps(row, ensure_ascii=False).replace("\u2028", "\\u2028").replace("\u2029", "\\u2029") + "\n")
-                if index % 25000 == 0:
+        with StageReporter(progress, "准备阅读器记录 " + directory.name, completed=0,
+                           total=messages.stat().st_size, unit="字节", cancel=cancel) as stage:
+            rows = 0
+            with messages.open("rb") as inp, (target / "messages.jsonl").open("w", encoding="utf-8", newline="\n") as out:
+                for index, raw_line in enumerate(inp):
                     _check_cancel(cancel)
+                    line = raw_line.decode("utf-8-sig" if index == 0 else "utf-8")
+                    if not line.strip():
+                        stage.update(completed=inp.tell())
+                        continue
+                    row = json.loads(line)
+                    if not isinstance(row, dict):
+                        raise ExportError(f"Invalid message object in {messages.name}, line {index + 1}")
+                    meta = row.get("_export", {})
+                    if isinstance(meta, dict):
+                        for relative in _media_references(meta):
+                            if relative not in mapping:
+                                _copy_asset(source, library, app, mapping, relative)
+                        row["_export"] = _rewrite_paths(meta, mapping)
+                    out.write(json.dumps(row, ensure_ascii=False).replace("\u2028", "\\u2028").replace("\u2029", "\\u2029") + "\n")
+                    rows += 1
+                    stage.update(completed=inp.tell(), detail=f"已准备 {rows:,} 条记录")
         progress(f"已准备账号：{directory.name}")
     summary = _read_json(source / "export_summary.json", {})
     (destination / "export_summary.json").write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
@@ -536,16 +576,104 @@ def _node_command(node: str) -> tuple[str, Path]:
 def _run_reader(node, arguments, progress):
     executable, script = _node_command(node)
     options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
-    completed = subprocess.run([executable, str(script), *arguments, "--json"],
-        capture_output=True, text=True, encoding="utf-8", errors="replace", **options)
-    if completed.stderr.strip():
-        progress(completed.stderr.strip())
-    if completed.returncode:
-        raise ExportError("Reader import failed: " + (completed.stderr.strip() or completed.stdout.strip()))
+    progress(ProgressEvent("阅读器合并：启动服务；此阶段完成后才能取消。", stage="阅读器合并"))
+    child = subprocess.Popen([executable, str(script), *arguments, "--json"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        encoding="utf-8", errors="replace", **options)
+    messages = queue.Queue()
+
+    def drain(name, pipe):
+        try:
+            for line in pipe:
+                messages.put((name, line))
+        except Exception as error:
+            messages.put(("error", error))
+        finally:
+            pipe.close()
+            messages.put((name, None))
+
+    threads = [threading.Thread(target=drain, args=(name, pipe), name="reader-import-" + name, daemon=True)
+               for name, pipe in (("stdout", child.stdout), ("stderr", child.stderr))]
+    for thread in threads:
+        thread.start()
+    stdout, stderr, ended = [], [], set()
+    callback_error = pipe_error = None
+    last_event = None
+    started = last_log = time.monotonic()
+
+    def report(event):
+        nonlocal callback_error, last_log
+        if callback_error is None:
+            try:
+                progress(event)
+            except Exception as error:
+                # Keep draining and let the transaction finish before propagating.
+                callback_error = error
+        last_log = time.monotonic()
+
     try:
-        return json.loads(completed.stdout)
+        while len(ended) < 2:
+            try:
+                name, line = messages.get(timeout=READER_PROGRESS_INTERVAL)
+            except queue.Empty:
+                name, line = "idle", None
+            if name == "error":
+                pipe_error = line
+            elif name in {"stdout", "stderr"} and line is None:
+                ended.add(name)
+            elif name == "stdout":
+                stdout.append(line)
+            elif name == "stderr":
+                if line.startswith(READER_PROGRESS_PREFIX):
+                    try:
+                        data = json.loads(line[len(READER_PROGRESS_PREFIX):])
+                        event = ProgressEvent(data["message"], stage=READER_STAGE_LABELS.get(data["stage"], data["stage"]),
+                            completed=data.get("completed"), total=data.get("total"),
+                            unit=data.get("unit", "个"), state=data.get("state", "running"))
+                    except (ValueError, TypeError, KeyError):
+                        stderr.append(line)
+                        report(line.rstrip())
+                    else:
+                        last_event = event if event.state == "running" else None
+                        report(event)
+                else:
+                    stderr.append(line)
+                    if line.strip():
+                        report(line.rstrip())
+            if len(ended) < 2 and time.monotonic() - last_log >= READER_PROGRESS_INTERVAL:
+                stage = last_event.stage if last_event else "等待阅读器下一阶段"
+                text = f"{stage}：仍在处理；合并服务已运行 {time.monotonic() - started:.1f} 秒"
+                if last_event and last_event.completed is not None:
+                    text += f"；已处理 {last_event.completed:,}"
+                    if last_event.total is not None:
+                        text += f"/{last_event.total:,}"
+                    text += " " + last_event.unit
+                report(ProgressEvent(text, stage=stage,
+                    completed=last_event.completed if last_event else None,
+                    total=last_event.total if last_event else None,
+                    unit=last_event.unit if last_event else "个"))
+    finally:
+        child.wait()
+        for thread in threads:
+            thread.join()
+    output, errors = "".join(stdout), "".join(stderr)
+    if child.returncode:
+        report(ProgressEvent("阅读器合并：失败", stage="阅读器合并", state="failed"))
+        raise ExportError("Reader import failed: " + (errors.strip() or output.strip()))
+    if pipe_error is not None:
+        raise ExportError("Reader import output failed: " + str(pipe_error)) from pipe_error
+    try:
+        result = json.loads(output)
     except ValueError as error:
-        raise ExportError("Reader import returned an invalid result: " + completed.stdout[:500]) from error
+        report(ProgressEvent("阅读器合并：结果无效", stage="阅读器合并", state="failed"))
+        raise ExportError("Reader import returned an invalid result: " + output[:500]) from error
+    if not isinstance(result, dict) or result.get("status") != "completed":
+        report(ProgressEvent("阅读器合并：未返回成功结果", stage="阅读器合并", state="failed"))
+        raise ExportError("Reader import returned an invalid result: " + output[:500])
+    if callback_error is not None:
+        raise callback_error
+    progress(ProgressEvent("阅读器合并：完成", stage="阅读器合并", state="completed"))
+    return result
 
 
 def organize_library(output, *, node="node", progress=print):

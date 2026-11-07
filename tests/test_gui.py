@@ -5,6 +5,7 @@ from contextlib import closing
 import json
 import os
 from pathlib import Path
+import queue
 import sqlite3
 import sys
 import tempfile
@@ -17,6 +18,7 @@ from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from duoshan_export import gui
+from duoshan_export.progress import ProgressEvent
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 try:
@@ -31,6 +33,34 @@ except ImportError:
 
 
 class SettingsTests(unittest.TestCase):
+    def test_progress_event_remains_a_string_with_optional_stage_counts(self):
+        event = ProgressEvent("正在处理", stage="校验媒体", completed=3, total=7, unit="文件")
+        self.assertIsInstance(event, str)
+        self.assertEqual(event, "正在处理")
+        self.assertEqual((event.stage, event.completed, event.total, event.unit, event.state),
+            ("校验媒体", 3, 7, "文件", "running"))
+        self.assertIsNone(ProgressEvent("扫描", stage="扫描").total)
+        with self.assertRaises(ValueError):
+            ProgressEvent("坏计数", stage="扫描", completed=-1)
+
+    def test_reader_port_selection_excludes_both_boundaries_and_range(self):
+        for port in (64967, 65000, 65066):
+            self.assertFalse(gui.reader_port_allowed(port))
+        for port in (64966, 65067):
+            self.assertTrue(gui.reader_port_allowed(port))
+        with patch.object(gui.socket, "socket") as factory, patch.object(gui.secrets, "randbelow", side_effect=(0, 64966 - 49152)):
+            probe = factory.return_value.__enter__.return_value
+            probe.bind.side_effect = [OSError("already bound"), None]
+            self.assertEqual(gui.available_reader_port(), 64966)
+            self.assertEqual(factory.call_count, 2)
+            self.assertEqual([call.args[0][1] for call in probe.bind.call_args_list], [49152, 64966])
+        with patch.object(gui.socket, "socket") as factory:
+            probe = factory.return_value.__enter__.return_value
+            probe.bind.side_effect = OSError("occupied")
+            with self.assertRaises(OSError):
+                gui.available_reader_port()
+            self.assertEqual(probe.bind.call_count, 64)
+            self.assertTrue(all(gui.reader_port_allowed(call.args[0][1]) for call in probe.bind.call_args_list))
     def test_source_labels_match_explicit_legacy_aliases(self):
         for value in ("WeChat", "com.tencent.mm", " 微信 "):
             self.assertEqual(gui._source_app(value), "wechat")
@@ -295,6 +325,90 @@ class MediaControlsTests(unittest.TestCase):
                 self.wait_for_worker()
         self.assertIn("成功 1", window.history_status.text())
         self.assertIn(long_url, window.log_view.toPlainText())
+
+    def test_structured_stage_progress_is_numeric_redacted_and_resets_by_stage(self):
+        window = self.window
+        window.password_edit.setText("stage-secret")
+        events = queue.Queue()
+        emitted = threading.Event()
+
+        def download(*args, **kwargs):
+            while not kwargs["cancel"]():
+                try:
+                    value = events.get(timeout=0.01)
+                except queue.Empty:
+                    continue
+                if value is None:
+                    return {"status": "completed", "totals": {}}
+                kwargs["progress"](value)
+                emitted.set()
+            return {"status": "cancelled", "totals": {}}
+
+        self.download.side_effect = download
+        window.library_download_check.setChecked(True)
+        window.library_download_button.click()
+
+        def send(event):
+            emitted.clear()
+            events.put(event)
+            self.wait_for_event(emitted)
+            QTest.qWait(20)
+
+        send(ProgressEvent("校验 stage-secret", stage="校验 stage-secret", completed=3, total=10, unit="文件"))
+        self.assertEqual(window.progress.maximum(), 100)
+        self.assertEqual(window.history_progress.value(), 30)
+        self.assertIn("3/10 文件 · 30%", window.history_stage_label.text())
+        self.assertNotIn("stage-secret", window.history_stage_label.text())
+        self.assertNotIn("stage-secret", window.log_view.toPlainText())
+        send(ProgressEvent("校验完成", stage="校验", completed=10, total=10, state="completed"))
+        self.assertEqual(window.history_progress.value(), 100)
+        self.assertIn("本阶段完成", window.history_stage_label.text())
+        self.assertNotIn("任务完成", window.history_stage_label.text())
+        self.assertIsNone(window.last_result)
+        self.assertTrue(window.worker.isRunning())
+        send(ProgressEvent("正在合并", stage="数据库合并"))
+        self.assertEqual(window.progress.maximum(), 0)
+        self.assertEqual(window.history_progress.maximum(), 0)
+        self.assertIn("总量未知", window.history_stage_label.text())
+        send(ProgressEvent("写入", stage="写入消息", completed=2**38, total=2**40, unit="条"))
+        self.assertEqual(window.history_progress.value(), 25)
+        send(ProgressEvent("无转换项目", stage="转码", completed=0, total=0, state="completed"))
+        self.assertEqual(window.progress.maximum(), 100)
+        self.assertIn("0/0", window.history_stage_label.text())
+        events.put(None)
+        self.wait_for_worker()
+        self.assertEqual(window.history_progress.value(), 100)
+        self.assertEqual(window.history_stage_label.text(), "任务完成")
+
+    def test_inspection_result_is_successful_completion(self):
+        from duoshan_export import library
+        window = self.window
+        window.sources = [str(self.root)]
+        with patch.object(library, "inspect_sources", return_value={"status": "inspected", "sources": []}):
+            window.inspect_button.click()
+            self.wait_for_worker()
+        self.assertEqual(window.last_result["status"], "inspected")
+        self.assertEqual(window.progress.value(), 100)
+        self.assertEqual(window.history_stage_label.text(), "任务完成")
+
+    def test_stage_counts_survive_cancel_and_failure_without_task_success(self):
+        window = self.window
+        window.library_download_check.setChecked(True)
+        for state in ("cancelled", "failed", "partial_failure"):
+            with self.subTest(state=state):
+                def download(*args, **kwargs):
+                    kwargs["progress"](ProgressEvent("处理到 3 条", stage="消息写入", completed=3, total=10,
+                        state="cancelled" if state == "cancelled" else "failed"))
+                    if state == "failed":
+                        raise RuntimeError("fixture write failed")
+                    return {"status": state, "totals": {}}
+                self.download.side_effect = download
+                window.library_download_button.click()
+                self.wait_for_worker()
+                self.assertEqual(window.history_progress.value(), 30)
+                self.assertIn("3/10", window.history_stage_label.text())
+                self.assertNotIn("任务完成", window.history_stage_label.text())
+                self.assertIn("任务已停止" if state == "cancelled" else "任务未完成", window.history_stage_label.text())
 
     def test_history_cancel_reaches_worker_and_retains_completed_totals(self):
         entered = threading.Event()
@@ -616,6 +730,93 @@ class MediaControlsTests(unittest.TestCase):
             self.assertFalse(window.reader_button.isEnabled())
         finally:
             window.worker = None
+
+    def test_reload_replaces_a_previous_forbidden_port(self):
+        window = self.window
+        reader = self.managed_reader()
+        window.reader_port = 64967
+        with patch.object(gui.shutil, "which", return_value="fixture-node"), \
+             patch.object(gui, "available_reader_port", return_value=65067), \
+             patch.object(gui.subprocess, "Popen") as popen:
+            popen.return_value.poll.return_value = None
+            window.reader_reload_button.click()
+            reader.poll.return_value = 0
+            window._check_reader_switch()
+            args = popen.call_args.args[0]
+            self.assertEqual(args[args.index("--port") + 1], "65067")
+            self.assertEqual(window.reader_port, 65067)
+
+    def test_close_waits_for_owned_reader_and_never_stops_unrelated_process(self):
+        window = self.window
+        reader = self.managed_reader()
+        unrelated = Mock()
+        window.show()
+        window.reader_pending_options = {"output": self.output}
+        window.reader_switch_timer.start()
+        window.close()
+        reader.terminate.assert_called_once()
+        self.assertTrue(window.close_requested)
+        self.assertTrue(window.reader_close_timer.isActive())
+        self.assertFalse(window.reader_switch_timer.isActive())
+        self.assertIsNone(window.reader_pending_options)
+        self.assertTrue(window.isVisible())
+        self.assertFalse(window.reader_button.isEnabled())
+        self.assertFalse(window.reader_reload_button.isEnabled())
+        self.assertFalse(window.library_choose_button.isEnabled())
+        self.assertFalse(window.library_download_button.isEnabled())
+        window._sync_reader_controls()
+        self.assertFalse(window.reader_button.isEnabled())
+        with patch.object(gui.subprocess, "Popen") as popen, patch.object(QFileDialog, "getExistingDirectory") as choose:
+            window._open_reader()
+            window._choose_library()
+            window._start("download")
+            popen.assert_not_called()
+            choose.assert_not_called()
+            self.download.assert_not_called()
+        reader.poll.return_value = 0
+        window._check_reader_close()
+        QTest.qWait(20)
+        self.assertFalse(window.isVisible())
+        self.assertFalse(window.reader_close_timer.isActive())
+        unrelated.terminate.assert_not_called()
+        unrelated.kill.assert_not_called()
+        reader.kill.assert_not_called()
+
+    def test_close_only_escalates_same_reader_handle_and_reports_stop_error(self):
+        window = self.window
+        reader = self.managed_reader()
+        window.close()
+        window.reader_close_started = time.monotonic() - 11
+        window._check_reader_close()
+        reader.kill.assert_called_once()
+        self.assertTrue(window.reader_close_forced)
+        window.reader_close_started = time.monotonic() - 11
+        window._check_reader_close()
+        window._error.assert_called_once()
+        self.assertFalse(window.close_requested)
+        self.assertFalse(window.reader_close_timer.isActive())
+        reader.poll.return_value = 0
+
+    def test_close_cancels_worker_then_finishes_without_second_close_click(self):
+        window = self.window
+        entered = threading.Event()
+
+        def download(*args, **kwargs):
+            entered.set()
+            while not kwargs["cancel"]():
+                time.sleep(0.01)
+            return {"status": "cancelled", "totals": {}}
+
+        self.download.side_effect = download
+        window.library_download_check.setChecked(True)
+        window.library_download_button.click()
+        self.wait_for_event(entered)
+        window.show()
+        window.close()
+        self.wait_for_worker()
+        QTest.qWait(20)
+        self.assertFalse(window.isVisible())
+        self.assertEqual(window.last_result["status"], "cancelled")
 
 
 if __name__ == "__main__":

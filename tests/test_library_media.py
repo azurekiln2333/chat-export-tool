@@ -45,6 +45,70 @@ class Session:
 
 
 class LibraryMediaTests(unittest.TestCase):
+    def test_download_reports_numeric_validation_download_and_patch_stages(self):
+        from duoshan_export.progress import ProgressEvent
+        self.add("duoshan", [{"type": 27, "content": {"resource_url": {"url_list": ["https://p.douyinpic.com/progress"]}}},
+                             {"type": 30, "content": {}}])
+        events = []
+        with patch.object(media, "_session", return_value=Session([Response(png_bytes())])):
+            result = media.download_library_media(self.library, self.work / "media", workers=1,
+                download_media=True, progress=events.append)
+        self.assertEqual(result["totals"], dict(downloaded=1, existing=0, failed=0, unsupported=1))
+        structured = [event for event in events if isinstance(event, ProgressEvent)]
+        scanning = [event for event in structured if event.stage == "扫描资料库媒体"]
+        self.assertIsNone(scanning[0].total)
+        self.assertEqual((scanning[1].completed, scanning[1].total), (0, 2))
+        self.assertEqual((scanning[-1].completed, scanning[-1].total, scanning[-1].state), (2, 2, "completed"))
+        self.assertTrue(all(event.unit == "条" for event in scanning))
+        validation = [event for event in structured if event.stage == "校验已有媒体"]
+        self.assertEqual((validation[0].completed, validation[0].total, validation[0].state), (0, 2, "running"))
+        self.assertEqual((validation[-1].completed, validation[-1].total, validation[-1].state), (2, 2, "completed"))
+        download = [event for event in structured if event.stage == "补全在线媒体"]
+        self.assertEqual((download[0].completed, download[0].total), (1, 2))
+        self.assertEqual((download[-1].completed, download[-1].total, download[-1].state), (2, 2, "completed"))
+        self.assertEqual(structured[-1].stage, "写入媒体索引")
+        self.assertEqual(structured[-1].state, "completed")
+        self.assertTrue(any(str(event).startswith("[✓]https://") for event in events))
+
+    def test_inventory_counts_only_requested_accounts_in_same_snapshot(self):
+        from duoshan_export.progress import ProgressEvent
+        wanted = self.add("duoshan", [{"type": 7, "content": "text"}, {"type": 30, "content": {}}])
+        self.add("xhs", [{"content_type": 1, "content": "another account"}])
+        events = []
+        inventory = media._inventory(self.library, [wanted], events.append, None)
+        self.assertEqual(len(inventory), 1)
+        self.assertTrue(all(isinstance(event, ProgressEvent) for event in events))
+        self.assertEqual((events[-1].completed, events[-1].total), (2, 2))
+        self.assertEqual(events[-1].state, "completed")
+
+    def test_patch_reports_heartbeat_without_fabricated_counts_and_preserves_errors(self):
+        from duoshan_export import progress as progress_module
+        for updates in (None, self.root / "updates.jsonl"):
+            events = []
+            heartbeat = threading.Event()
+            stage = "恢复媒体索引" if updates is None else "写入媒体索引"
+
+            def report(event):
+                events.append(event)
+                if len(events) >= 2:
+                    heartbeat.set()
+
+            def run(*args, **kwargs):
+                self.assertTrue(heartbeat.wait(2), "Long patch did not report a heartbeat")
+                return subprocess.CompletedProcess(args[0], 0, '{"status":"patched"}', '')
+
+            with patch.object(progress_module, "PROGRESS_INTERVAL", 0.01), patch.object(media.subprocess, "run", side_effect=run):
+                self.assertEqual(media._patch(self.library, updates, "node", report), {"status": "patched"})
+            self.assertGreaterEqual(len(events), 3)
+            self.assertTrue(all(event.stage == stage and event.total is None and event.completed is None for event in events))
+            self.assertEqual(events[0].state, "running")
+            self.assertEqual(events[-1].state, "completed")
+        failed = []
+        with patch.object(media.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, '', 'fixture patch failure')):
+            with self.assertRaisesRegex(ExportError, "fixture patch failure"):
+                media._patch(self.library, None, "node", failed.append)
+        self.assertEqual(failed[-1].state, "failed")
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="library-media-")
         self.addCleanup(self.temp.cleanup)

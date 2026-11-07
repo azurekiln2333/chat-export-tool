@@ -51,6 +51,17 @@ Each source commits independently. If a later source fails or the operation
 is cancelled between stages, earlier completed imports remain available.
 The work directory and `import_history.jsonl` retain diagnostic history.
 Successful local attachments are retained when an offline update lacks them.
+Progress identifies the current phase and reports real counts or bytes, with
+periodic liveness during slow archive traversal and codec calls. A stage reaching
+its total does not mean the entire import has completed: reader merging and
+account-file publication still need to succeed.
+
+Retrying a cancelled unified import creates a fresh work run. Existing final
+attachments are verified by size and full hash and reused, but private database
+scans, message staging and playback conversion may run again because conversion
+markers belong to the previous run. This is not full stage-checkpoint resume.
+Completed imports remain available; a cancelled first import may have media in
+the destination before a reader database has been created.
 Networking is disabled by default; `--download-media` opts into the existing
 adapters' supported media downloads. It cannot recover media absent from a
 backup or a resource no longer available from its original service.
