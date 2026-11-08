@@ -25,6 +25,8 @@ export function accountSourceLabel(account) {
     case 'wechat': return '微信';
     case 'duoshan': return '多闪/抖音';
     case 'xhs': return '小红书';
+    case 'wechat_pc': return 'PC 微信';
+    case 'qq_pc': return 'PC QQ';
     default: return '来源未识别';
   }
 }

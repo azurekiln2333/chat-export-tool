@@ -373,7 +373,15 @@ async function* readJsonLines(file) {
     }
   } finally {
     lines.close();
-    stream.destroy();
+    // A failed import can stop the generator before EOF. On Windows destroy()
+    // schedules handle closure; wait before returning so a retry can move its
+    // private staging directory immediately without a transient sharing error.
+    if (!stream.closed) {
+      await new Promise(resolve => {
+        stream.once('close', resolve);
+        stream.destroy();
+      });
+    }
   }
 }
 

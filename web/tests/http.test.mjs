@@ -531,6 +531,8 @@ test('shutdown bounds a stalled media connection and releases SQLite', { timeout
   const database = path.join(context.fixture.dir, 'reader.sqlite');
   fs.renameSync(database, database + '.closed');
   fs.renameSync(database + '.closed', database);
+  fs.renameSync(filename, filename + '.closed');
+  fs.renameSync(filename + '.closed', filename);
 });
 
 /** Every permanent write exposed by the design; used for the auth matrix. */

@@ -32,8 +32,12 @@ directories and the Node.js version documented in `web/package.json`.
 
 ## Workflow
 
-1. Add a backup directory, several archives/databases, or drag paths into the
-   window. A parent directory can contain several supported app backups.
+1. Open **导入聊天记录**. Local PC WeChat/QQ accounts appear automatically from
+   the Windows Documents known folder, including redirected locations. Each row
+   has a checkbox and **账号** column. Automatically found accounts start unchecked;
+   manually added backup directories, archives or databases start checked.
+   A parent directory can contain several supported app backups. Use **刷新本机账号**
+   to refresh discovery; checks/imports use only the selected concrete rows.
 2. Choose a shared library directory and a separate working directory. Keep
    both outside original backup paths. The work volume needs room for private
    database snapshots and export staging.
@@ -43,11 +47,21 @@ directories and the Node.js version documented in `web/package.json`.
    that same library for future backups or another app. New data is merged by
    the library service; the GUI does not rewrite messages itself.
 5. Open **聊天资料库** to view account totals and source labels (**多闪/抖音**,
-   **微信**, **小红书**) and start the local reader. **切换资料库** selects another
+   **微信**, **小红书**, **PC 微信**, **PC QQ**) and start the local reader. **切换资料库** selects another
    existing library and immediately refreshes this overview.
 
 Online downloads are off by default. The opt-in checkbox enables media
 downloads through the existing adapter's supported network rules.
+
+PC imports copy and verify database/WAL snapshots into the chosen work directory
+before parsing. Originals are read-only. See [PC versions and key requirements](desktop-import.md)
+for the current limits: WeChat 4 and QQ NT support verified read-only key recovery
+from logged-in clients. Decrypted classic QQ `Msg3.0` records are supported;
+classic proprietary encryption still needs a readable decrypted copy. QQ local
+media is matched independently of the client's index; PC WeChat media recovery
+is not implemented. Mixed QQ accounts report partial imports and remain retryable.
+The separate PC key controls accept a key or
+existing JSON file for this task only; they are never saved in preferences.
 
 Import and task pages show the **current stage**, actual completed/total counts
 and a percentage whenever the total is known. This percentage belongs to that
@@ -111,12 +125,14 @@ stop and keeps the window alive until the current step finishes. It never
 force-kills a database transaction.
 
 The GUI stores only output/work paths, timezone and the Node executable in its
-per-user settings. It does not store database keys. Logs can be explicitly saved
+portable settings. It does not store database keys. Logs can be explicitly saved
 through **保存本次日志**. This interface does not delete or clean up backups.
-Settings now use `%LOCALAPPDATA%/ChatArchive/settings.json`. When that file is
-unavailable, the previous `AzureKilnChatArchive/settings.json` is read so saved
-library/work paths remain available. The next settings save writes to the new
-location and leaves the old file intact. Network opt-in is never persisted.
+Settings use `PROJECT/.work/gui/settings.json`, or `CHAT_ARCHIVE_RUNTIME/settings.json`
+when that environment override is set. The source launcher also places temporary
+files in that runtime directory. Old `%LOCALAPPDATA%/ChatArchive/settings.json`
+and `AzureKilnChatArchive/settings.json` remain read-only fallbacks, preserving
+saved library/work paths without writing beside the old preferences. Network
+opt-in is never persisted.
 On first launch, an existing `ChatExportAll` in the current directory or its
 parent is selected when available; otherwise the default is
 `CURRENT_DIRECTORY/ChatExportAll`. Work defaults to

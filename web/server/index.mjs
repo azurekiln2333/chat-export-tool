@@ -142,8 +142,8 @@ async function serveStatic(req, res, distDir, pathname) {
   await new Promise((resolve, reject) => {
     const stream = createReadStream(target);
     stream.once('error', reject);
-    res.once('close', () => { stream.destroy(); resolve(); });
-    stream.once('end', resolve);
+    res.once('close', () => stream.destroy());
+    stream.once('close', resolve);
     stream.pipe(res);
   });
 }
@@ -179,7 +179,13 @@ export async function createApp({ dataDir, databasePath, token = '', distDir = D
       ...(session ? { csrf_token: session.csrf } : {}) };
   }
 
-  const server = http.createServer(async (req, res) => {
+  const pendingRequests = new Set();
+  const server = http.createServer((req, res) => {
+    const task = handleRequest(req, res);
+    pendingRequests.add(task);
+    task.finally(() => pendingRequests.delete(task)).catch(() => {});
+  });
+  async function handleRequest(req, res) {
     headers(res);
     try {
       // Token-protected instances may receive a public Host through a proxy.
@@ -290,7 +296,7 @@ export async function createApp({ dataDir, databasePath, token = '', distDir = D
       const message = safeStatus === 500 ? 'The request could not be completed.' : error.message;
       json(res, safeStatus, { error: { code: error.code || 'internal_error', message } });
     }
-  });
+  }
   server.requestTimeout = 30_000;
   server.headersTimeout = 15_000;
   let closed = false;
@@ -309,6 +315,9 @@ export async function createApp({ dataDir, databasePath, token = '', distDir = D
           server.close(error => error ? reject(error) : resolve());
           server.closeIdleConnections();
         });
+        // Socket closure precedes asynchronous file-stream cleanup on Windows.
+        // Wait for handlers to release media handles before reporting shutdown.
+        await Promise.allSettled([...pendingRequests]);
       } finally { clearTimeout(deadline); closeStore(); }
     })();
     return closePromise;

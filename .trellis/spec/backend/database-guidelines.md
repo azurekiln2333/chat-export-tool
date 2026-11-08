@@ -13,6 +13,12 @@ commit/rollback but do not close. Use package context managers,
 `contextlib.closing`, or explicit `finally: db.close()`. Windows cleanup is part
 of the contract, including repeated operations in one process.
 
+Node JSONL readers must await the stream's `close` after `destroy()` on early
+exit; closing readline alone does not release the Windows file handle before
+the caller retries/moves its stage. Reader shutdown waits for request handlers
+to finish closing media streams after sockets close. Verify immediate rename
+of both database and streamed media in shutdown/error tests.
+
 Do not migrate original Duoshan tables. `decrypt_database` and the exporter
 preserve their structure and values; media enrichment owns only `export_*`
 objects. `media_index.index_media` refreshes owned rows transactionally, checks

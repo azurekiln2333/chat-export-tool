@@ -58,6 +58,8 @@ const mediaMissingLabel = computed(() => model.value.media.label);
 const segments = computed(() => model.value.segments);
 const corners = computed(() => model.value.corners);
 const localAttachments = computed(() => model.value.localAttachments);
+const localMediaLabels = computed(() => model.value.localMediaLabels);
+const originalAttachments = computed(() => model.value.originalAttachments);
 const bubbleClasses = computed(() => model.value.classes);
 
 const hidden = computed(() => model.value.flags.hidden);
@@ -186,7 +188,7 @@ watch(
               class="sticker"
               :src="stickerSrc"
               :alt="message.text || '表情'"
-              :title="message.text || '点击查看原图'"
+              :title="localMediaLabels[mediaSource] || message.text || '点击查看图片'"
               loading="lazy"
               decoding="async"
             />
@@ -204,14 +206,17 @@ watch(
         <p v-else-if="mediaMissing" class="media-unavailable">
           {{ mediaMissingLabel }}
         </p>
+        <p v-if="localMediaLabels[mediaSource]" class="media-unavailable">
+          {{ localMediaLabels[mediaSource] }}
+        </p>
 
-        <MediaBlock
-          v-for="path in localAttachments"
-          :key="path"
-          :source="path"
-          :kind="kindFromPath(path)"
-          :file-name="basename(path)"
-        />
+        <template v-for="path in localAttachments" :key="path">
+          <MediaBlock :source="path" :kind="kindFromPath(path)" :file-name="basename(path)" />
+          <p v-if="localMediaLabels[path]" class="media-unavailable">{{ localMediaLabels[path] }}</p>
+        </template>
+        <p v-for="original in originalAttachments" :key="original.path">
+          <a :href="original.href" download target="_blank" rel="noopener">下载原始文件</a>
+        </p>
       </div>
 
       <img

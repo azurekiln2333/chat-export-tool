@@ -18,7 +18,9 @@ const epoch = Date.UTC(2026, 0, 2, 0, 0);
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-library-test-'));
   // These independent synthetic fixtures are outside the analysis workspace.
-  assert.ok(!path.resolve(root).toLowerCase().startsWith('e:\\analysis\\'));
+  assert.ok(process.env.CHAT_TEST_RETAIN_ROOT
+    ? path.resolve(root).startsWith(path.resolve(process.env.CHAT_TEST_RETAIN_ROOT) + path.sep)
+    : !path.resolve(root).toLowerCase().startsWith('e:\\analysis\\'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   return root;
 }
@@ -43,6 +45,47 @@ function query(root, sql, ...params) {
   const db = new DatabaseSync(path.join(root, 'reader.sqlite'));
   try { return db.prepare(sql).all(...params); } finally { db.close(); }
 }
+
+test('QQ originals supersede thumbnails and survive later cache eviction', async t => {
+  const root = fixture(t), output = path.join(root, 'library'), uid = 'abcd'.repeat(8);
+  const thumb = { path: 'attachments/qq_pc/thumb.png', kind: 'image', status: 'ok',
+    variant: 'thumbnail', reference_id: 'image:resource' };
+  const original = { ...thumb, path: 'attachments/qq_pc/original.png', variant: 'original' };
+  fs.mkdirSync(path.join(output, 'attachments/qq_pc'), { recursive: true });
+  for (const asset of [thumb, original]) fs.writeFileSync(path.join(output, asset.path), 'retained synthetic image');
+  const snapshot = (name, asset) => source(root, name, uid, 'qq_pc', [message(uid, 'image', 'Recorded image', false, {
+    app: 'qq_pc', media: asset || { kind: 'image', status: 'missing' },
+    local_media: asset ? [asset.path] : [], desktop_media: asset ? [asset] : [],
+    original_media: asset?.variant === 'original' ? [asset.path] : [],
+    desktop_media_summary: { requested: 1, unresolved: asset ? 0 : 1 },
+    media_status: asset ? (asset.variant === 'thumbnail' ? 'thumbnail' : 'ok') : 'missing',
+  })]);
+  const initial = snapshot('thumb', thumb);
+  await importLibrary({ sourceDir: initial, outputDir: output, app: 'qq_pc' });
+  let meta = JSON.parse(query(output, 'SELECT meta_json FROM messages')[0].meta_json);
+  assert.equal(meta.media.variant, 'thumbnail');
+  const full = snapshot('original', original);
+  await importLibrary({ sourceDir: full, outputDir: output, app: 'qq_pc' });
+  meta = JSON.parse(query(output, 'SELECT meta_json FROM messages')[0].meta_json);
+  assert.equal(meta.media.path, original.path);
+  assert.deepEqual(meta.local_media, [original.path]);
+  assert.deepEqual(meta.desktop_media, [original]);
+  for (const [name, asset] of [['later-thumb', thumb], ['same-bytes-thumb', { ...thumb, path: original.path }], ['later-missing', null]]) {
+    const next = snapshot(name, asset);
+    // Model a later database snapshot so this is a real merge, not a repeat.
+    const summaryPath = path.join(next, 'export_summary.json');
+    fs.writeFileSync(summaryPath, JSON.stringify({ ...JSON.parse(fs.readFileSync(summaryPath)), fixture_revision: name }));
+    await importLibrary({ sourceDir: next, outputDir: output, app: 'qq_pc' });
+    meta = JSON.parse(query(output, 'SELECT meta_json FROM messages')[0].meta_json);
+    assert.equal(meta.media.path, original.path);
+    assert.equal(meta.media_status, 'ok');
+    assert.equal(meta.desktop_media_summary.unresolved, 0);
+    assert.deepEqual(meta.local_media, [original.path]);
+    assert.deepEqual(meta.desktop_media, [original]);
+    assert.deepEqual(meta.original_media, [original.path]);
+  }
+  assert.ok(fs.existsSync(path.join(output, thumb.path)), 'superseded cache files are retained');
+});
 
 test('import progress reports real work and keeps fingerprints and committed data unchanged', async t => {
   const root = fixture(t), output = path.join(root, 'library');
@@ -150,6 +193,39 @@ test('independent app imports merge, repeated import is idempotent, and prefixed
   } finally { store.close(); }
 });
 
+test('PC sources keep distinct account labels, directions and edits after updates and reopening', async t => {
+  const root = fixture(t), output = path.join(root, 'library');
+  const wxpc = 'abcdef0123456789abcdef0123456789', qqpc = 'fedcba9876543210fedcba9876543210';
+  for (const [uid, app] of [[wxpc, 'wechat_pc'], [qqpc, 'qq_pc']]) {
+    const input = source(root, app, uid, app, [message(uid, 'own', 'My text', true), message(uid, 'peer', 'Their text')]);
+    await importLibrary({ sourceDir: input, outputDir: output, app });
+  }
+  const store = new ChatStore(output);
+  try {
+    await store.initialize();
+    assert.deepEqual(Object.fromEntries(store.listAccounts().map(account => [account.uid, account.source_app])),
+      { [wxpc]: 'wechat_pc', [qqpc]: 'qq_pc' });
+    assert.equal(store.getMessage(wxpc, 'own').sender, wxpc);
+    assert.equal(store.getMessage(wxpc, 'peer').sender, 'peer');
+    store.updateMessage(wxpc, 'own', { expected_revision: 0, text_override: 'Retained edit', note: 'Retained note' });
+  } finally { store.close(); }
+  const later = source(root, 'later-pc', wxpc, 'WeChat PC', [message(wxpc, 'own', 'Changed raw text', true),
+    message(wxpc, 'new', 'New text')]);
+  await importLibrary({ sourceDir: later, outputDir: output, app: 'wechat_pc' });
+  await organizeLibrary({ outputDir: output });
+  assert.ok(fs.existsSync(path.join(output, 'wxpc_' + wxpc, 'messages.jsonl')));
+  assert.ok(fs.existsSync(path.join(output, 'qqpc_' + qqpc, 'messages.jsonl')));
+  const reopened = new ChatStore(output);
+  try {
+    assert.equal((await reopened.initialize({ force: true })).imported, false);
+    assert.equal(reopened.getMessage(wxpc, 'own').text, 'Retained edit');
+    assert.equal(reopened.getMessage(wxpc, 'own').edit.note, 'Retained note');
+    assert.ok(reopened.getMessage(wxpc, 'peer'), 'an absent older record is retained');
+    assert.equal(reopened.listAccounts().find(account => account.uid === wxpc).message_count, 3);
+    assert.equal(reopened.listAccounts().find(account => account.uid === qqpc).source_app, 'qq_pc');
+  } finally { reopened.close(); }
+});
+
 test('new snapshot appends, retains absent history and annotations, unions media, suppresses deletions', async t => {
   const root = fixture(t), output = path.join(root, 'library');
   fs.mkdirSync(path.join(output, 'attachments', 'wechat'), { recursive: true });
@@ -214,6 +290,9 @@ test('invalid source rolls back all message/account/history mutations', async t 
   assert.deepEqual(query(output, 'SELECT * FROM messages'), before);
   assert.equal(query(output, 'SELECT * FROM accounts').length, 1);
   assert.equal(query(output, 'SELECT * FROM import_batches').length, 1);
+  const retained = bad + '-retained';
+  fs.renameSync(bad, retained);
+  assert.ok(fs.existsSync(path.join(retained, WX, 'messages.jsonl')), 'failed imports release source handles before returning');
 });
 
 test('organization migrates only folder labels and preserves existing raw rows and edits', async t => {

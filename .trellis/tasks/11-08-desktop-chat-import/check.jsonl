@@ -1,0 +1,5 @@
+{"file":".trellis/spec/backend/unified-import.md","reason":"selection and regression"}
+{"file":".trellis/spec/backend/database-guidelines.md","reason":"source retention"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"checks"}
+{"file":".trellis/spec/backend/desktop-import.md","reason":"desktop coverage, crypto and media verification"}
+{"file":".trellis/spec/frontend/quality-guidelines.md","reason":"thumbnail and original-attachment rendering"}

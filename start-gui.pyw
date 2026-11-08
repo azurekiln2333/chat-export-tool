@@ -1,5 +1,6 @@
 """Source-checkout launcher; shares backend packages with the local environment."""
 from pathlib import Path
+import os
 import site
 import sys
 
@@ -11,6 +12,11 @@ if local_packages.is_dir():
     site.addsitedir(str(local_packages))
 
 try:
+    runtime = Path(os.environ.get("CHAT_ARCHIVE_RUNTIME") or root / ".work" / "gui").expanduser().resolve()
+    temporary = runtime / "temp"
+    temporary.mkdir(parents=True, exist_ok=True)
+    os.environ["CHAT_ARCHIVE_RUNTIME"] = str(runtime)
+    os.environ["TEMP"] = os.environ["TMP"] = str(temporary)
     from duoshan_export.gui import main
     raise SystemExit(main())
 except Exception as error:

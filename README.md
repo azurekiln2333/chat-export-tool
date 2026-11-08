@@ -13,6 +13,15 @@ default `--app auto` policy Duoshan behaviour is unchanged; Xiaohongshu
 decryption additionally needs `pip install "duoshan-chat-export-tool[xhs]"`
 (the `cryptography` package).
 
+The **Chat Archive** GUI and unified `import` command also support Android
+WeChat and independent Windows WeChat/QQ NT adapters. Windows account discovery
+uses the redirected Documents known folder, with per-account checkboxes.
+See [PC import, keys and current format limits](docs/desktop-import.md) and
+[unified library updates](docs/unified-import.md). QQ NT supports verified read-only
+key recovery from a logged-in client and local cache recovery. Decrypted classic
+QQ `Msg3.0` records are parsed separately; its proprietary encryption still needs
+a readable decrypted copy. Mixed accounts report incomplete imports explicitly.
+
 The tool only **reads** the backup you give it. It never logs in, never contacts
 the network unless you explicitly ask it to, and never modifies the original
 files. The original message content is preserved byte for byte.

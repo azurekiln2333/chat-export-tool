@@ -6,6 +6,12 @@ into one reader library. Use the same output directory when importing another
 app, another account, or a newer backup. The [desktop GUI](gui.md) uses this
 same pipeline.
 
+Independent `wechat_pc` and `qq_pc` adapters also accept Windows account
+directories. `scan --local` discovers those under the Windows Documents known
+folder without writing files. See [PC versions, copying and key requirements](desktop-import.md)
+before importing encrypted desktop data. PC snapshots go to the selected work
+directory even when the original client data lives on another volume.
+
 ## Identify and inspect backups
 
 ```powershell

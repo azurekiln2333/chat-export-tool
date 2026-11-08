@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import io
+from itertools import chain
 import json
 import os
 from pathlib import Path
@@ -31,9 +32,10 @@ from .progress import ProgressEvent, StageReporter
 from .runtime import file_sha256
 
 PACKAGES = {"com.tencent.mm": "wechat", "my.maya.android": "duoshan", "com.xingin.xhs": "xhs"}
-LABELS = {"wechat": "微信", "duoshan": "多闪", "xhs": "小红书"}
-PREFIXES = {"wechat": "wx", "duoshan": "dy", "xhs": "xhs"}
-ACCOUNT_NAME = re.compile(r"^(?:(?:wx|xhs|dy)_)?(?:[0-9]+|[0-9a-f]{16,64})$")
+LABELS = {"wechat": "微信", "duoshan": "多闪", "xhs": "小红书", "wechat_pc": "PC 微信", "qq_pc": "PC QQ"}
+APP_NAMES = {"wechat": "WeChat", "duoshan": "Duoshan", "xhs": "Xiaohongshu", "wechat_pc": "WeChat PC", "qq_pc": "QQ PC"}
+PREFIXES = {"wechat": "wx", "duoshan": "dy", "xhs": "xhs", "wechat_pc": "wxpc", "qq_pc": "qqpc"}
+ACCOUNT_NAME = re.compile(r"^(?:(?:wx|xhs|dy|wxpc|qqpc)_)?(?:[0-9]+|[0-9a-f]{16,64})$")
 ARCHIVE_SUFFIXES = (".tar.zst", ".tar.gz", ".tar", ".tgz", ".tzst", ".zst")
 HISTORY = "import_history.jsonl"
 IMPORT_VERSION = 1
@@ -109,6 +111,19 @@ def discover_sources(paths: Iterable[str | os.PathLike]) -> list[dict]:
     def walk(path: Path, depth: int):
         if path.is_symlink():
             raise ExportError(f"Select the actual backup directory, not a symbolic link: {path}")
+        # Desktop locations have their own account boundary and formats. Never
+        # route them through Android adapters on a similar folder/table name.
+        if not _package_hint(path):
+            from .desktop_sources import discover_desktop_sources
+            desktop = discover_desktop_sources([path])
+            if desktop:
+                for item in desktop:
+                    found[(item["app"], os.path.normcase(item["source"]))] = item
+                # A mixed parent can contain PC accounts and Android backups.
+                # Stop only at a concrete desktop account, not at that parent.
+                if any(path == Path(item["source"]) or path.is_relative_to(Path(item["source"]))
+                       for item in desktop):
+                    return
         if path.is_file():
             hint = _package_hint(path)
             package = _archive_package(path) if _is_archive(path) else None
@@ -133,11 +148,16 @@ def discover_sources(paths: Iterable[str | os.PathLike]) -> list[dict]:
         summary = path / "export_summary.json"
         if summary.is_file() and any(p.is_dir() and (p / "messages.jsonl").is_file() for p in children):
             label = str(_read_json(summary, {}).get("app", "")).lower()
-            app = next((a for a, aliases in {"wechat": ("wechat", "微信"),
+            app = next((a for a, aliases in {"wechat_pc": ("wechat_pc", "wechat pc", "pc 微信"),
+                        "qq_pc": ("qq_pc", "qq pc", "pc qq"), "wechat": ("wechat", "微信"),
                         "xhs": ("xiaohongshu", "xhs", "小红书"),
                         "duoshan": ("duoshan", "多闪")}.items() if any(s == label for s in aliases)), None)
             if app:
-                add(path, next(k for k, v in PACKAGES.items() if v == app), exported=True)
+                if app in {"wechat_pc", "qq_pc"}:
+                    found[(app, os.path.normcase(str(path)))] = {"app": app, "source": str(path),
+                        "label": LABELS[app] + " · " + path.name, "kind": "export", "package": ""}
+                else:
+                    add(path, next(k for k, v in PACKAGES.items() if v == app), exported=True)
                 return
         archives = [p for p in children if _is_archive(p) and not p.name.lower().startswith(("apk.", "obb."))]
         if archives:
@@ -158,8 +178,11 @@ def discover_sources(paths: Iterable[str | os.PathLike]) -> list[dict]:
             raise ExportError(f"Backup path does not exist: {path}")
         previous = set(found)
         walk(path, 0)
-        if set(found) == previous and not any(Path(r["source"]) == path or Path(r["source"]).is_relative_to(path) for r in found.values()):
-            raise ExportError(f"No supported WeChat, Duoshan or Xiaohongshu backup found: {path}")
+        if set(found) == previous and not any(
+                Path(r["source"]) == path or Path(r["source"]).is_relative_to(path)
+                or (r["kind"] == "desktop" and path.is_relative_to(Path(r["source"])))
+                for r in found.values()):
+            raise ExportError(f"No supported WeChat, QQ, Duoshan or Xiaohongshu chat source found: {path}")
     if not found:
         raise ExportError("Select at least one supported backup.")
     return sorted(found.values(), key=lambda item: (item["app"], item["source"]))
@@ -213,11 +236,11 @@ def _new_run(work: Path, app: str) -> Path:
     return run
 
 
-def _source_signature(source: Path, progress: Callable[[str], None], cancel=None) -> str:
+def _source_signature(source: Path, progress: Callable[[str], None], cancel=None, *, source_files=None) -> str:
     digest = hashlib.sha256(f"library-source-v{IMPORT_VERSION}\n".encode())
     with StageReporter(progress, "枚举备份文件", completed=0, unit="个", cancel=cancel) as stage:
         files = []
-        for path in ([source] if source.is_file() else source.rglob("*")):
+        for path in (source_files if source_files is not None else ([source] if source.is_file() else source.rglob("*"))):
             _check_cancel(cancel)
             if path.is_file() and not path.name.lower().startswith(("apk.tar", "obb.tar")):
                 if path.is_symlink():
@@ -311,7 +334,10 @@ def _completed_source_ids(output: Path) -> set[str]:
     try:
         if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='import_batches'").fetchone():
             return set()
-        return {row[0] for row in db.execute("SELECT source_id FROM import_batches WHERE projection_status='completed'")}
+        # A projected readable subset is durable, but is not a completed source.
+        # Its namespaced batch ID must never authorize skipping the unread DBs.
+        return {row[0] for row in db.execute("SELECT source_id FROM import_batches WHERE projection_status='completed'")
+                if row[0] and not row[0].startswith("partial:")}
     finally:
         db.close()
 
@@ -336,7 +362,7 @@ class _ProgressStream(io.TextIOBase):
 
 
 def inspect_sources(paths, work, *, progress=print, cancel=None, sqlcipher_module_path=None,
-                    password=None, imei=None, uin=None) -> dict:
+                    password=None, imei=None, uin=None, desktop_keys=None) -> dict:
     work = Path(work).expanduser().resolve()
     paths = _validated_source_paths(paths, None, work)
     results = []
@@ -355,6 +381,10 @@ def inspect_sources(paths, work, *, progress=print, cancel=None, sqlcipher_modul
                         count = sum(1 for line in stream if line.strip())
                     accounts.append({"uid": directory.name.split("_", 1)[-1], "message_count": count})
             result = {"accounts": accounts}
+        elif source["app"] in {"wechat_pc", "qq_pc"}:
+            from .apps.desktop import inspect_backup
+            result = inspect_backup(path, run, progress=progress, cancel=cancel,
+                                    keys=desktop_keys, sqlcipher_module_path=sqlcipher_module_path)
         elif source["app"] == "wechat":
             from .apps.wechat import inspect_backup
             result = inspect_backup(path, run, progress=progress, cancel=cancel,
@@ -365,15 +395,21 @@ def inspect_sources(paths, work, *, progress=print, cancel=None, sqlcipher_modul
             result = _inspect(SimpleNamespace(source=path, work_dir=run, app=source["app"],
                                               sqlcipher_module_path=sqlcipher_module_path))
         results.append({**source, **result, "work": str(run)})
-    return {"status": "inspected", "sources": results}
+    return {"status": "partial" if any(item.get("status") == "partial" or item.get("failed_databases")
+                                       for item in results) else "inspected", "sources": results}
 
 
 def _export_source(source, output, work, *, timezone, download_media, progress, cancel,
-                   sqlcipher_module_path, password, imei, uin, media_output):
+                   sqlcipher_module_path, password, imei, uin, media_output, desktop_keys=None):
     path = Path(source["source"])
     if source["kind"] == "export":
         return path
-    if source["app"] == "wechat":
+    if source["app"] in {"wechat_pc", "qq_pc"}:
+        from .apps.desktop import export_backup
+        export_backup(path, output, work, timezone=timezone, progress=progress, cancel=cancel,
+                      keys=desktop_keys, sqlcipher_module_path=sqlcipher_module_path,
+                      media_output=media_output)
+    elif source["app"] == "wechat":
         from .apps.wechat import export_backup
         export_backup(path, output, work, timezone=timezone, progress=progress, cancel=cancel,
                       sqlcipher_module_path=sqlcipher_module_path, password=password,
@@ -686,7 +722,7 @@ def organize_library(output, *, node="node", progress=print):
 
 def import_sources(paths, output, work, *, timezone="Asia/Shanghai", progress=print, cancel=None,
                    download_media=False, sqlcipher_module_path=None, node="node",
-                   password=None, imei=None, uin=None) -> dict:
+                   password=None, imei=None, uin=None, desktop_keys=None) -> dict:
     output, work = Path(output).expanduser().resolve(), Path(work).expanduser().resolve()
     paths = _validated_source_paths(paths, output, work)
     sources = discover_sources(paths)
@@ -704,8 +740,20 @@ def import_sources(paths, output, work, *, timezone="Asia/Shanghai", progress=pr
             _check_cancel(cancel)
             path = Path(source["source"])
             progress("校验备份内容：" + source["label"])
-            signature = _source_signature(path, progress, cancel)
+            if source["kind"] == "desktop":
+                from .desktop_sources import desktop_database_files
+                from .apps.desktop_media import desktop_media_files
+                signature = _source_signature(path, progress, cancel,
+                    source_files=chain(desktop_database_files(path), desktop_media_files(source, cancel=cancel)))
+            else:
+                signature = _source_signature(path, progress, cancel)
             policy = f"{timezone}|download={int(download_media)}"
+            if source["kind"] == "desktop":
+                # Empty or freshly created databases may be byte-identical for
+                # different PC accounts. Their imports must stay independent.
+                # Bump the desktop policy when parser/media coverage changes so
+                # older DB-only completion markers cannot skip newly supported data.
+                policy += "|desktop=2|account=" + source["uid"]
             source_id = source["app"] + ":" + hashlib.sha256((signature + policy).encode()).hexdigest()
             if source_id in completed_sources and (output / "reader.sqlite").is_file():
                 results.append({**source, "status": "unchanged", "source_id": source_id})
@@ -719,9 +767,27 @@ def import_sources(paths, output, work, *, timezone="Asia/Shanghai", progress=pr
                 exported = _export_source(source, run / "export", run / "work", timezone=timezone,
                     download_media=download_media, progress=progress, cancel=cancel,
                     sqlcipher_module_path=sqlcipher_module_path, password=password,
-                    imei=imei, uin=uin, media_output=output)
+                    imei=imei, uin=uin, media_output=output, desktop_keys=desktop_keys)
                 _check_cancel(cancel)
+                adapter_summary = _read_json(exported / "export_summary.json", {})
+                failed_databases = adapter_summary.get("failed_databases") or []
+                adapter_status = adapter_summary.get("status", "completed")
+                if adapter_status not in {"completed", "partial"}:
+                    raise ExportError("导出尚未完成，不能合并到阅读器：" + str(adapter_status))
+                if not isinstance(failed_databases, list):
+                    raise ExportError("导出失败数据库清单无效，不能标记导入完成。")
+                partial = adapter_status == "partial" or bool(failed_databases)
+                source_status = "partial" if partial else "completed"
+                batch_source_id = ("partial:" if partial else "") + source_id
                 manifests, media = _prepare_reader_stage(exported, run / "reader", output, source["app"], progress, cancel)
+                # The reader fingerprints its staged summary. Include the input
+                # signature and coverage, even when changed cache files produce
+                # identical messages. This keeps each committed source marker
+                # independent and lets a later complete retry supersede partials.
+                staged_summary = {**adapter_summary, "_library_import": {
+                    "source_id": source_id, "status": source_status}}
+                (run / "reader" / "export_summary.json").write_text(
+                    json.dumps(staged_summary, ensure_ascii=False), encoding="utf-8")
                 _check_cancel(cancel)
                 retained = output / ".import-history" / run.name
                 previous_metadata = {name: (output / name).exists() for name in
@@ -732,11 +798,12 @@ def import_sources(paths, output, work, *, timezone="Asia/Shanghai", progress=pr
                 summary = _read_json(output / "export_summary.json", {})
                 apps = set(summary.get("apps", []))
                 old_label = str(summary.get("app", "")).lower()
-                for app, label in {"wechat": "wechat", "xhs": "xiaohongshu", "duoshan": "duoshan"}.items():
-                    if label in old_label:
-                        apps.add(app)
+                if not apps:
+                    for app, label in APP_NAMES.items():
+                        if label.lower() == old_label:
+                            apps.add(app)
                 apps.add(source["app"])
-                summary.update(app=", ".join({"wechat": "WeChat", "xhs": "Xiaohongshu", "duoshan": "Duoshan"}[a] for a in sorted(apps)),
+                summary.update(app=", ".join(APP_NAMES[a] for a in sorted(apps)),
                                apps=sorted(apps), timezone=timezone, library_format=IMPORT_VERSION)
                 prepared_metadata["export_summary.json"] = summary
                 changed_metadata = []
@@ -748,7 +815,7 @@ def import_sources(paths, output, work, *, timezone="Asia/Shanghai", progress=pr
                     progress("正在合并到阅读器；此阶段完成后才能取消。")
                     reader_started = True
                     result = _run_reader(node, ["--source", str(run / "reader"), "--output", str(output),
-                                               "--app", source["app"], "--source-id", source_id], progress)
+                                               "--app", source["app"], "--source-id", batch_source_id], progress)
                 except Exception:
                     # If the DB transaction failed, restore root metadata. If a
                     # projection failed after commit, keep media/summary for the
@@ -756,7 +823,7 @@ def import_sources(paths, output, work, *, timezone="Asia/Shanghai", progress=pr
                     db = sqlite3.connect((output / "reader.sqlite").as_uri() + "?mode=ro", uri=True) if reader_started and (output / "reader.sqlite").exists() else None
                     try:
                         committed = bool(db and db.execute("SELECT 1 FROM sqlite_master WHERE name='import_batches'").fetchone()
-                                         and db.execute("SELECT 1 FROM import_batches WHERE source_id=?", (source_id,)).fetchone())
+                                         and db.execute("SELECT 1 FROM import_batches WHERE source_id=?", (batch_source_id,)).fetchone())
                     finally:
                         if db:
                             db.close()
@@ -770,13 +837,18 @@ def import_sources(paths, output, work, *, timezone="Asia/Shanghai", progress=pr
                             if existed and old.exists():
                                 old.rename(current)
                     raise
-                item = {**event, "status": "completed", "media": media, "result": result}
+                item = {**event, "status": source_status, "media": media, "result": result}
+                if partial:
+                    item.update(failed_databases=failed_databases, retry_required=True,
+                                warnings=adapter_summary.get("warnings", []))
                 _append_history(output, item)
-                completed_sources.add(source_id)
+                if not partial:
+                    completed_sources.add(source_id)
                 results.append(item)
-                progress("导入完成：" + source["label"])
+                progress(("部分导入：可读取记录已合并，仍有数据库未读取，下次将重试：" if partial else "导入完成：") + source["label"])
             except Exception as error:
                 _append_history(output, {**event, "status": "failed", "error": str(error)})
                 raise
-    return {"status": "completed", "imports": results, "output": str(output),
+    return {"status": "partial" if any(item["status"] == "partial" for item in results) else "completed",
+            "imports": results, "output": str(output),
             "reader_database": str(output / "reader.sqlite")}

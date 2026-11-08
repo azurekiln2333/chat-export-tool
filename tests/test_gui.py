@@ -11,13 +11,12 @@ import sys
 import tempfile
 import threading
 import time
-import types
 import unittest
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from duoshan_export import gui
+from duoshan_export import desktop_sources, gui, library_media
 from duoshan_export.progress import ProgressEvent
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -68,6 +67,8 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(gui._source_app(value), "xhs")
         for value in ("Duoshan", "douyin", "my.maya.android", "多闪/抖音"):
             self.assertEqual(gui._source_app(value), "duoshan")
+        for value, app in (("PC 微信", "wechat_pc"), ("WeChat PC", "wechat_pc"), ("PC QQ", "qq_pc")):
+            self.assertEqual(gui._source_app(value), app)
         self.assertEqual(gui._source_app("WeChat + Duoshan"), "")
 
     def test_summary_source_uses_manifest_then_prefix_and_recorded_metadata(self):
@@ -100,7 +101,7 @@ class SettingsTests(unittest.TestCase):
 
     def test_legacy_settings_are_read_without_mutation_and_new_settings_win(self):
         with tempfile.TemporaryDirectory(prefix="chat-gui-settings-") as directory:
-            with patch.dict(os.environ, {"LOCALAPPDATA": directory}):
+            with patch.dict(os.environ, {"LOCALAPPDATA": directory, "CHAT_ARCHIVE_RUNTIME": str(Path(directory) / "portable")}):
                 legacy = Path(directory) / "AzureKilnChatArchive/settings.json"
                 legacy.parent.mkdir()
                 old = {"output": "existing-library", "work": "existing-work"}
@@ -108,16 +109,35 @@ class SettingsTests(unittest.TestCase):
                 before = legacy.read_bytes()
                 self.assertEqual(gui.read_settings(), old)
                 current = gui.settings_path()
-                self.assertEqual(current, Path(directory) / "ChatArchive/settings.json")
+                self.assertEqual(current, Path(directory) / "portable/settings.json")
                 self.assertFalse(current.exists())
                 current.parent.mkdir()
                 current.write_text(json.dumps({"output": "new-library"}), encoding="utf-8")
                 self.assertEqual(gui.read_settings(), {"output": "new-library"})
                 self.assertEqual(legacy.read_bytes(), before)
 
+    def test_partial_batch_history_does_not_claim_whole_source_completed(self):
+        with tempfile.TemporaryDirectory(prefix="chat-gui-partial-") as directory:
+            root = Path(directory)
+            with closing(sqlite3.connect(root / "reader.sqlite")) as db:
+                db.executescript("CREATE TABLE accounts(uid TEXT,name TEXT);"
+                    "CREATE TABLE conversations(uid TEXT,message_count INTEGER);"
+                    "CREATE TABLE import_batches(app TEXT,source_id TEXT,imported_at TEXT,result_json TEXT,projection_status TEXT);")
+                db.executemany("INSERT INTO import_batches VALUES('qq_pc',?,?,?,?)", [
+                    ("partial:qq_pc:first", "1", '{"status":"completed","inserted":2}', "completed"),
+                    ("qq_pc:second", "2", '{"status":"completed","inserted":4}', "completed"),
+                    ("partial:qq_pc:third", "3", '{"status":"completed"}', "pending"),
+                ])
+                db.commit()
+            before = (root / "reader.sqlite").read_bytes()
+            rows = gui.library_summary(root)["history"]
+            self.assertEqual([row["status"] for row in rows], ["待完成导出", "已完成", "部分完成，待重试"])
+            self.assertEqual(rows[-1]["inserted"], 2)
+            self.assertEqual((root / "reader.sqlite").read_bytes(), before)
+
     def test_invalid_settings_can_fall_back_to_legacy(self):
         with tempfile.TemporaryDirectory(prefix="chat-gui-settings-") as directory:
-            with patch.dict(os.environ, {"LOCALAPPDATA": directory}):
+            with patch.dict(os.environ, {"LOCALAPPDATA": directory, "CHAT_ARCHIVE_RUNTIME": str(Path(directory) / "portable")}):
                 current = gui.settings_path()
                 current.parent.mkdir()
                 current.write_text("{broken", encoding="utf-8")
@@ -142,13 +162,11 @@ class MediaControlsTests(unittest.TestCase):
         with closing(sqlite3.connect(self.output / "reader.sqlite")) as db:
             db.executescript("CREATE TABLE accounts(uid TEXT,name TEXT);"
                              "CREATE TABLE conversations(uid TEXT,message_count INTEGER);")
-        environment = patch.dict(os.environ, {"LOCALAPPDATA": str(self.root / "settings")})
+        environment = patch.dict(os.environ, {"LOCALAPPDATA": str(self.root / "settings"), "CHAT_ARCHIVE_RUNTIME": str(self.root / "runtime")})
         environment.start()
         self.addCleanup(environment.stop)
-        backend = types.ModuleType("duoshan_export.library_media")
         self.download = Mock(return_value={"status": "completed", "totals": {
             "downloaded": 2, "existing": 3, "failed": 1, "unsupported": 4}})
-        backend.download_library_media = self.download
         self.recorded_url = "https://media.example.invalid/a.jpg?sign=keep%2Bthis%3D&expires=123&opaque=<image>"
         self.attempted_url = "https://cdn.example.invalid/b.jpg?signature=full%2Ftoken&width=1000"
         self.details_result = {"status": "completed", "as_of": "2026-11-07T00:00:00Z",
@@ -172,14 +190,19 @@ class MediaControlsTests(unittest.TestCase):
             "report_text": str(self.output / "media_reports/details.txt"),
             "report_json": str(self.output / "media_reports/details.json")}
         self.inspect = Mock(return_value=self.details_result)
-        backend.inspect_library_media = self.inspect
-        module = patch.dict(sys.modules, {"duoshan_export.library_media": backend})
-        module.start()
-        self.addCleanup(module.stop)
-        self.window = gui.create_window(output=self.output, work=self.root / "work")
+        # Patch individual functions. Replacing sys.modules can evict newly
+        # imported modules while leaving stale package attributes behind, so
+        # later worker imports escape mocks and reach actual local accounts.
+        for mocked in (patch.object(library_media, "download_library_media", self.download),
+                       patch.object(library_media, "inspect_library_media", self.inspect),
+                       patch.object(desktop_sources, "discover_desktop_sources", return_value=[])):
+            mocked.start()
+            self.addCleanup(mocked.stop)
+        self.window = gui.create_window(output=self.output, work=self.root / "work", auto_discover=False)
         self.window._error = Mock()
 
     def tearDown(self):
+        self.wait_for_discovery()
         if self.window.details_worker is not None:
             self.window.details_worker.cancel_event.set()
             self.wait_for_details()
@@ -202,6 +225,12 @@ class MediaControlsTests(unittest.TestCase):
         while self.window.details_worker is not None and time.monotonic() < deadline:
             QTest.qWait(20)
         self.assertIsNone(self.window.details_worker, "Media detail worker failed to finish")
+
+    def wait_for_discovery(self):
+        deadline = time.monotonic() + 8
+        while self.window.discovery_worker is not None and time.monotonic() < deadline:
+            QTest.qWait(20)
+        self.assertIsNone(self.window.discovery_worker, "Local discovery worker failed to finish")
 
     def wait_for_event(self, event):
         deadline = time.monotonic() + 5
@@ -384,12 +413,290 @@ class MediaControlsTests(unittest.TestCase):
         from duoshan_export import library
         window = self.window
         window.sources = [str(self.root)]
+        window._fill_source_table([{"source": str(self.root), "app": "wechat", "kind": "backup"}])
         with patch.object(library, "inspect_sources", return_value={"status": "inspected", "sources": []}):
             window.inspect_button.click()
             self.wait_for_worker()
         self.assertEqual(window.last_result["status"], "inspected")
         self.assertEqual(window.progress.value(), 100)
         self.assertEqual(window.history_stage_label.text(), "任务完成")
+
+    def test_detected_row_checkboxes_process_only_checked_android_sibling(self):
+        from duoshan_export import library
+        window = self.window
+        parent = self.root / "android"
+        first, second = parent / "user_0", parent / "user_999"
+        first.mkdir(parents=True)
+        second.mkdir()
+        records = [{"source": str(path), "app": "wechat", "account": path.name, "kind": "backup"} for path in (first, second)]
+        with patch.object(library, "discover_sources", return_value=records):
+            window._add_paths([str(parent)])
+            self.wait_for_worker()
+        self.assertTrue(any(label.text() == "导入聊天记录" for label in window.findChildren(QLabel)))
+        self.assertEqual(window.source_table.columnCount(), 5)
+        self.assertEqual(window.source_table.item(0, 2).text(), "user_0")
+        self.assertEqual(window.source_table.rowCount(), 2)
+        window.source_table.item(1, 0).setCheckState(Qt.CheckState.Unchecked)
+        with patch.object(library, "inspect_sources", return_value={"status": "inspected", "sources": [records[0]]}) as inspect:
+            window.inspect_button.click()
+            self.wait_for_worker()
+        self.assertEqual(inspect.call_args.args[0], (first,))
+        self.assertEqual(window.source_table.rowCount(), 2)
+        self.assertEqual(window.source_table.item(1, 0).checkState(), Qt.CheckState.Unchecked)
+        with patch.object(library, "import_sources", return_value={"status": "completed"}) as importer:
+            window.import_button.click()
+            self.wait_for_worker()
+        self.assertEqual(importer.call_args.args[0], (first,))
+        self.assertNotIn(parent, importer.call_args.args[0])
+        window.source_table.item(0, 0).setCheckState(Qt.CheckState.Unchecked)
+        with patch.object(library, "inspect_sources") as inspect:
+            window.inspect_button.click()
+            inspect.assert_not_called()
+        self.assertIn("勾选", window._error.call_args.args[0])
+
+    def test_manual_refresh_preserves_checks_errors_and_removable_rows(self):
+        from duoshan_export import library
+        window = self.window
+        parent, unknown = self.root / "sources", self.root / "unknown"
+        first, second = parent / "first", parent / "second"
+        first.mkdir(parents=True)
+        second.mkdir()
+        unknown.mkdir()
+        records = [{"source": str(first), "app": "wechat_pc", "account": "first", "kind": "desktop"},
+                   {"source": str(second), "app": "qq_pc", "account": "second", "kind": "desktop"}]
+        def discover(paths):
+            if Path(paths[0]) == unknown:
+                raise RuntimeError("Unsupported synthetic source")
+            return records
+        with patch.object(library, "discover_sources", side_effect=discover):
+            window._add_paths([str(parent), str(unknown)])
+            self.wait_for_worker()
+            self.assertEqual(window.source_table.rowCount(), 3)
+            self.assertEqual(window.source_table.item(2, 4).text(), "识别失败")
+            self.assertIn("Unsupported synthetic", window.source_table.item(2, 4).toolTip())
+            window.source_table.item(1, 0).setCheckState(Qt.CheckState.Unchecked)
+            window.scan_button.click()
+            self.wait_for_worker()
+            self.assertEqual(window.source_table.item(1, 0).checkState(), Qt.CheckState.Unchecked)
+            window.source_table.selectRow(0)
+            window._remove_selected()
+            window.scan_button.click()
+            self.wait_for_worker()
+        self.assertEqual({item["source"] for item in window.source_records}, {str(second), str(unknown)})
+        self.assertIn(str(parent), window.sources)
+
+    def test_local_discovery_is_async_unchecked_and_preserves_manual_rows(self):
+        from duoshan_export import desktop_sources
+        window = self.window
+        manual = self.root / "manual"
+        local = self.root / "pc-account"
+        manual.mkdir()
+        local.mkdir()
+        window._add_paths([str(manual)], discover=False)
+        records = [{"source": str(local), "app": "wechat_pc", "account": "wx-fixture", "uid": "a" * 32,
+                    "kind": "desktop", "format": "wechat4", "status": "已识别"}]
+        thread_ids = []
+        def discover():
+            thread_ids.append(threading.get_ident())
+            return records
+        with patch.object(desktop_sources, "discover_desktop_sources", side_effect=discover):
+            window.local_refresh_button.click()
+            self.wait_for_discovery()
+            self.assertNotEqual(thread_ids[0], threading.get_ident())
+            self.assertEqual(window.source_table.rowCount(), 2)
+            self.assertEqual(window.source_table.item(1, 0).checkState(), Qt.CheckState.Unchecked)
+            self.assertEqual(window.source_table.item(1, 1).text(), "PC 微信")
+            self.assertEqual(window.source_table.item(1, 2).text(), "wx-fixture")
+            window.source_table.item(1, 0).setCheckState(Qt.CheckState.Checked)
+            window.local_refresh_button.click()
+            self.wait_for_discovery()
+            self.assertEqual(window.source_table.item(1, 0).checkState(), Qt.CheckState.Checked)
+            window.source_table.selectRow(1)
+            window._remove_selected()
+            window.local_refresh_button.click()
+            self.wait_for_discovery()
+        self.assertEqual(window.source_table.rowCount(), 1)
+        self.assertEqual(window.source_records[0]["source"], str(manual))
+        self.download.assert_not_called()
+        self.assertIsNone(window.worker)
+
+    def test_cancelled_manual_discovery_keeps_unprocessed_source_rows(self):
+        from duoshan_export import library
+        window = self.window
+        first, second = self.root / "first-scan", self.root / "second-scan"
+        first.mkdir()
+        second.mkdir()
+        entered, release = threading.Event(), threading.Event()
+        def discover(paths):
+            entered.set()
+            release.wait(5)
+            return [{"source": str(first), "app": "wechat", "account": "first", "kind": "backup"}]
+        with patch.object(library, "discover_sources", side_effect=discover) as scan:
+            try:
+                window._add_paths([first, second])
+                self.wait_for_event(entered)
+                window._cancel()
+                release.set()
+                self.wait_for_worker()
+            finally:
+                release.set()
+                self.wait_for_worker()
+        self.assertEqual(scan.call_count, 1)
+        self.assertEqual(window.last_result["status"], "cancelled")
+        self.assertEqual({item["source"] for item in window.source_records}, {str(first), str(second)})
+        pending = next(item for item in window.source_records if item["source"] == str(second))
+        self.assertEqual(pending["status"], "pending")
+        self.assertTrue(window.source_checks[window._source_key(pending)])
+
+    def test_startup_discovers_local_accounts_without_running_import(self):
+        from duoshan_export import desktop_sources, library
+        with patch.object(desktop_sources, "discover_desktop_sources", return_value=[]) as discover, \
+             patch.object(library, "import_sources") as importer:
+            other = gui.create_window(output=self.output, work=self.root / "work")
+            try:
+                deadline = time.monotonic() + 5
+                while (not discover.called or other.discovery_worker is not None) and time.monotonic() < deadline:
+                    QTest.qWait(20)
+                discover.assert_called_once_with()
+                importer.assert_not_called()
+                self.assertIsNone(other.discovery_worker)
+            finally:
+                other.close()
+                other.deleteLater()
+                self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+    def test_startup_with_manual_sources_also_discovers_local_accounts(self):
+        from duoshan_export import library
+        source = self.root / "manual-startup"
+        source.mkdir()
+        manual_entered, release = threading.Event(), threading.Event()
+
+        def manual(paths):
+            manual_entered.set()
+            release.wait(5)
+            return [{"source": str(source), "app": "wechat", "account": "phone", "kind": "backup"}]
+
+        local_records = [{"source": str(self.root / "local-startup"), "app": "qq_pc", "account": "10001", "kind": "desktop"}]
+        with patch.object(library, "discover_sources", side_effect=manual), \
+             patch.object(desktop_sources, "discover_desktop_sources", return_value=local_records) as discover:
+            other = gui.create_window(sources=[source], output=self.output, work=self.root / "work")
+            try:
+                self.wait_for_event(manual_entered)
+                self.assertTrue(other.pending_local_discovery)
+                discover.assert_not_called()
+                release.set()
+                deadline = time.monotonic() + 5
+                while (other.worker is not None or not discover.called or other.discovery_worker is not None) and time.monotonic() < deadline:
+                    QTest.qWait(20)
+                discover.assert_called_once_with()
+                self.assertIsNone(other.worker)
+                self.assertIsNone(other.discovery_worker)
+                self.assertEqual([item["account"] for item in other.source_records], ["phone", "10001"])
+                self.assertEqual([other.source_table.item(i, 0).checkState() for i in range(2)],
+                    [Qt.CheckState.Checked, Qt.CheckState.Unchecked])
+            finally:
+                release.set()
+                if other.worker is not None:
+                    other.worker.wait(5000)
+                if other.discovery_worker is not None:
+                    other.discovery_worker.wait(5000)
+                self.app.processEvents()
+                other.close()
+                other.deleteLater()
+                self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+    def test_manually_adding_an_unchecked_local_account_checks_and_retains_it(self):
+        from duoshan_export import library
+        window = self.window
+        source = self.root / "previously-local"
+        source.mkdir()
+        record = {"source": str(source), "app": "wechat_pc", "account": "fixture", "kind": "desktop"}
+        window._fill_source_table([{**record, "_origin": "local"}])
+        self.assertEqual(window.source_table.item(0, 0).checkState(), Qt.CheckState.Unchecked)
+        with patch.object(library, "discover_sources", return_value=[record]):
+            window._add_paths([source])
+            self.wait_for_worker()
+        self.assertEqual(window.source_table.rowCount(), 1)
+        self.assertEqual(window.source_table.item(0, 0).checkState(), Qt.CheckState.Checked)
+        window.local_refresh_button.click()
+        self.wait_for_discovery()
+        self.assertEqual(window.source_table.rowCount(), 1)
+        self.assertEqual(window.source_records[0]["_origin"], "manual")
+
+    def test_close_waits_for_local_discovery_to_finish(self):
+        window = self.window
+        entered, release = threading.Event(), threading.Event()
+
+        def discover():
+            entered.set()
+            release.wait(5)
+            return []
+
+        with patch.object(desktop_sources, "discover_desktop_sources", side_effect=discover):
+            try:
+                window.show()
+                window.local_refresh_button.click()
+                self.wait_for_event(entered)
+                window.close()
+                self.assertTrue(window.close_requested)
+                self.assertTrue(window.isVisible())
+                self.assertFalse(window.local_refresh_button.isEnabled())
+                release.set()
+                self.wait_for_discovery()
+                QTest.qWait(20)
+                self.assertFalse(window.isVisible())
+            finally:
+                release.set()
+                self.wait_for_discovery()
+
+    def test_pc_keys_only_apply_selected_pc_accounts_and_are_never_saved_or_logged(self):
+        from duoshan_export import library
+        window = self.window
+        source = self.root / "pc-account"
+        source.mkdir()
+        window._fill_source_table([{"source": str(source), "app": "qq_pc", "account": "10001", "uid": "pcuid", "kind": "desktop"}])
+        keyfile = self.root / "synthetic-keys.json"
+        keyfile.write_text(json.dumps({"database.db": "private-file-key"}), encoding="utf-8")
+        window.desktop_key_file_edit.setText(str(keyfile))
+        window.desktop_key_edit.setText("private-entered-key")
+        def inspect(*args, **kwargs):
+            kwargs["progress"]("key detail private-file-key private-entered-key")
+            return {"status": "inspected", "fixture": "private-file-key private-entered-key"}
+        with patch.object(library, "inspect_sources", side_effect=inspect) as inspector:
+            window.inspect_button.click()
+            self.wait_for_worker()
+        self.assertEqual(inspector.call_args.kwargs["desktop_keys"], {"database.db": "private-file-key", "pcuid": "private-entered-key"})
+        self.assertIn("[已隐藏]", window.log_view.toPlainText())
+        for value in ("private-file-key", "private-entered-key"):
+            self.assertNotIn(value, window.log_view.toPlainText())
+            self.assertNotIn(value, window.result_view.toPlainText())
+        saved = gui.settings_path().read_text(encoding="utf-8")
+        self.assertNotIn("private-", saved)
+        self.assertNotIn("synthetic-keys", saved)
+        self.assertEqual(set(json.loads(saved)), {"output", "work", "timezone", "node"})
+        self.assertEqual(keyfile.read_text(encoding="utf-8"), json.dumps({"database.db": "private-file-key"}))
+
+    def test_bad_key_file_reports_no_content_and_is_ignored_for_android(self):
+        from duoshan_export import library
+        window = self.window
+        source = self.root / "account"
+        source.mkdir()
+        window._fill_source_table([{"source": str(source), "app": "wechat_pc", "account": "fixture", "kind": "desktop"}])
+        keyfile = self.root / "bad-keys.json"
+        keyfile.write_text("{private-broken-key", encoding="utf-8")
+        window.desktop_key_file_edit.setText(str(keyfile))
+        with patch.object(library, "inspect_sources") as inspect:
+            window.inspect_button.click()
+            inspect.assert_not_called()
+        self.assertIn("JSON", window._error.call_args.args[0])
+        self.assertNotIn("private-broken-key", window._error.call_args.args[0])
+        window.source_records = []
+        window.source_table.setRowCount(0)
+        window._fill_source_table([{"source": str(source), "app": "wechat", "kind": "backup"}])
+        with patch.object(library, "inspect_sources", return_value={"status": "inspected"}) as inspect:
+            window.inspect_button.click()
+            self.wait_for_worker()
+        self.assertNotIn("desktop_keys", inspect.call_args.kwargs)
 
     def test_stage_counts_survive_cancel_and_failure_without_task_success(self):
         window = self.window
@@ -409,6 +716,28 @@ class MediaControlsTests(unittest.TestCase):
                 self.assertIn("3/10", window.history_stage_label.text())
                 self.assertNotIn("任务完成", window.history_stage_label.text())
                 self.assertIn("任务已停止" if state == "cancelled" else "任务未完成", window.history_stage_label.text())
+
+    def test_partial_import_refreshes_visible_accounts_and_stays_on_task_history(self):
+        from duoshan_export import library
+        window = self.window
+        source = self.root / "partial-account"
+        source.mkdir()
+        window._fill_source_table([{"source": str(source), "app": "qq_pc", "account": "fixture", "kind": "desktop"}])
+        def partially_import(*args, **kwargs):
+            with closing(sqlite3.connect(self.output / "reader.sqlite")) as db:
+                db.execute("INSERT INTO accounts VALUES('fixture','QQ fixture')")
+                db.execute("INSERT INTO conversations VALUES('fixture',2)")
+                db.commit()
+            return {"status": "partial", "imports": [{"status": "partial", "failed_databases": [{"database": "Msg3.0.db"}]}]}
+        with patch.object(library, "import_sources", side_effect=partially_import), patch.object(window, "switchTo", wraps=window.switchTo) as switch:
+            window.import_button.click()
+            self.wait_for_worker()
+        self.assertEqual(window.last_result["status"], "partial")
+        self.assertEqual(window.account_table.rowCount(), 1)
+        self.assertIn("2 条消息", window.library_count.text())
+        self.assertIs(switch.call_args.args[0], window.history_page)
+        self.assertIn("任务未完成", window.history_stage_label.text())
+        self.assertNotIn("导入完成。", window.log_view.toPlainText())
 
     def test_history_cancel_reaches_worker_and_retains_completed_totals(self):
         entered = threading.Event()

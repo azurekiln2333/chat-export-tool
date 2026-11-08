@@ -1,0 +1,5 @@
+{"file":".trellis/spec/backend/export-contract.md","reason":"source retention and interchange"}
+{"file":".trellis/spec/backend/unified-import.md","reason":"incremental and GUI contract"}
+{"file":".trellis/spec/backend/database-guidelines.md","reason":"private snapshots"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"checks"}
+{"file":".trellis/spec/backend/desktop-import.md","reason":"desktop snapshots, partial coverage and cache updates"}

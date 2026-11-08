@@ -10,6 +10,13 @@
 需要额外安装 `cryptography`（`pip install "duoshan-chat-export-tool[xhs]"`）。
 详见 [docs/xhs-export.md](docs/xhs-export.md)。
 
+**Chat Archive 图形工具的“导入聊天记录”** 可汇总 Android 微信、多闪、小红书，
+并通过独立适配器解析 PC 微信和 QQ NT。Windows 文档路径自动识别，账号逐行显示并可
+勾选导入；每次先复制到指定工作目录，再解密解析。QQ NT 支持从已登录客户端只读验证
+密钥及本地缓存媒体恢复；已解密的旧版 QQ `Msg3.0` 单独解析，经典私有加密库仍需可读
+解密副本。混合账号未全部读出时明确显示部分导入。详见 [PC 导入说明](docs/desktop-import.md)
+和 [统一资料库与更新](docs/unified-import.md)。
+
 工具只**读取**你提供的备份，不会登录、不会修改原始文件，也**默认不联网**。
 英文说明见 [README.md](README.md)。
 

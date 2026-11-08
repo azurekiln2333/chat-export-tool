@@ -39,11 +39,16 @@ messages to satisfy language tests.
 - Missing-media labels describe the recorded state: `not_downloaded` means
   no local download is attached; generic `failed` does not prove URL expiry.
   Direct users to local download details for the recorded reason and URLs.
+- QQ recovered `desktop_media` with `variant=thumbnail` is labelled as a
+  thumbnail. Stable `reference_id` links later originals to earlier thumbnails;
+  incremental cache loss cannot downgrade a verified stored original. Render
+  contained `original_media` as download links when separate from playback,
+  preserving original audio alongside WAV derivatives.
 - Preserve original bubble/inline emoji metadata and place message text above
   animated corner layers. Keep original audio attachments as well as voices.
 - Surface edit/hidden badges, revision conflicts and restoration clearly.
 - Label each account with its API `source_app`: 微信, 多闪/抖音, 小红书, or
-  来源未识别. Never infer the source from an account ID or nickname.
+  PC 微信, PC QQ, or 来源未识别. Never infer the source from an account ID or nickname.
 - Distinguish locally undownloaded media from download failure. Generic
   failure status does not establish URL expiry; direct users to media details.
 - Translate API failures into Chinese display messages while retaining machine

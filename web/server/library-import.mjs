@@ -5,7 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { isDeepStrictEqual, parseArgs } from 'node:util';
 import { pathToFileURL } from 'node:url';
-import { APP_PREFIX, accountDirectories } from './account-layout.mjs';
+import { APP_PREFIX, accountDirectories, canonicalSourceApp } from './account-layout.mjs';
 import { ChatStore, accountName, dayFromTimeText, deletionHash, hashFile,
   localMediaMap, normalizeRow, readJsonFile, readJsonLines } from './store.mjs';
 
@@ -51,7 +51,7 @@ function progressStage(progress, stage, message, { total = null, unit = '条' } 
 }
 
 function checkApp(app) {
-  if (!Object.hasOwn(APP_PREFIX, app)) throw new Error('Choose wechat, duoshan, or xhs.');
+  if (!Object.hasOwn(APP_PREFIX, app)) throw new Error('Choose wechat, duoshan, xhs, wechat_pc, or qq_pc.');
   return app;
 }
 
@@ -59,6 +59,8 @@ function appForAccount(root, account) {
   if (account.app) return account.app;
   const stats = readJsonFile(path.join(root, account.directory, 'statistics.json'));
   const label = String(stats?.app || '').toLowerCase();
+  const explicit = canonicalSourceApp(label);
+  if (explicit) return explicit;
   if (label.includes('wechat')) return 'wechat';
   if (label.includes('xiaohongshu') || label === 'xhs') return 'xhs';
   if (label.includes('duoshan')) return 'duoshan';
@@ -152,6 +154,42 @@ function mergedMeta(previous, incoming) {
   const combined = { ...old, ...next };
   combined.local_media = [...new Set([...(old.local_media || []), ...(next.local_media || [])])];
   if (old.media?.status === 'ok' && next.media?.status !== 'ok') combined.media = old.media;
+  if (Array.isArray(old.desktop_media) || Array.isArray(next.desktop_media)) {
+    // Cache eviction must not downgrade an earlier verified original. Resource
+    // identity associates a thumbnail with its later original across imports.
+    const assets = new Map();
+    for (const item of [...(old.desktop_media || []), ...(next.desktop_media || [])]) {
+      if (!item?.path) continue;
+      const prior = assets.get(item.path);
+      if (prior && prior.variant !== 'thumbnail' && item.variant === 'thumbnail') continue;
+      assets.set(item.path, item);
+    }
+    const originals = new Map([...assets.values()]
+      .filter(item => item.reference_id && item.variant !== 'thumbnail')
+      .map(item => [item.reference_id, item]));
+    const superseded = new Set([...assets.values()]
+      .filter(item => item.variant === 'thumbnail' && originals.has(item.reference_id))
+      .map(item => item.path));
+    combined.desktop_media = [...assets.values()].filter(item => !superseded.has(item.path));
+    combined.local_media = combined.local_media.filter(relative => !superseded.has(relative));
+    if (superseded.has(combined.media?.path)) {
+      combined.media = originals.get(assets.get(combined.media.path).reference_id);
+    } else if (assets.has(combined.media?.path)) {
+      combined.media = assets.get(combined.media.path);
+    }
+    if (Array.isArray(old.original_media) || Array.isArray(next.original_media)) {
+      combined.original_media = [...new Set([...(old.original_media || []), ...(next.original_media || [])])];
+    }
+    const before = old.desktop_media_summary, after = next.desktop_media_summary;
+    if (before && after && before.requested === after.requested && before.unresolved < after.unresolved) {
+      combined.desktop_media_summary = before;
+    }
+    const unresolved = combined.desktop_media_summary?.unresolved || 0;
+    const thumbs = combined.desktop_media.filter(item => item.variant === 'thumbnail').length;
+    combined.media_status = unresolved ? (combined.desktop_media.length ? 'partial' : 'missing')
+      : thumbs ? (thumbs === combined.desktop_media.length ? 'thumbnail' : 'partial')
+        : combined.desktop_media.length ? 'ok' : next.media_status;
+  }
   return JSON.stringify(combined);
 }
 
@@ -228,7 +266,8 @@ function rebuildConversations(db, uid, progress) {
 }
 
 function validateLocalMedia(meta, root) {
-  const candidates = [...(Array.isArray(meta.local_media) ? meta.local_media : []), meta.media?.status === 'ok' ? meta.media.path : ''];
+  const candidates = [...(Array.isArray(meta.local_media) ? meta.local_media : []),
+    ...(Array.isArray(meta.original_media) ? meta.original_media : []), meta.media?.status === 'ok' ? meta.media.path : ''];
   for (const relative of candidates.filter(Boolean)) {
     if (typeof relative !== 'string' || !relative.startsWith('attachments/') || relative.includes('\\')
       || relative.split('/').some(part => part === '..' || part === '.')) throw new Error('Invalid local media path in import');

@@ -25,7 +25,7 @@ import urllib.request
 from .progress import ProgressEvent
 
 APP_TITLE = "Chat Archive"
-APP_NAMES = {"wechat": "微信", "xhs": "小红书", "duoshan": "多闪/抖音"}
+APP_NAMES = {"wechat": "微信", "xhs": "小红书", "duoshan": "多闪/抖音", "wechat_pc": "PC 微信", "qq_pc": "PC QQ"}
 GUI_HINT = "桌面界面需要 PyQt6 与 PyQt6-Fluent-Widgets。请在工具环境运行：pip install \".[gui]\""
 
 
@@ -46,14 +46,14 @@ def available_reader_port() -> int:
 
 
 def settings_path() -> Path:
-    base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".config")
-    return base / "ChatArchive" / "settings.json"
+    base = Path(os.environ.get("CHAT_ARCHIVE_RUNTIME") or Path(__file__).resolve().parents[2] / ".work" / "gui")
+    return base.expanduser().resolve() / "settings.json"
 
 
 def read_settings() -> dict:
     current = settings_path()
-    legacy = current.parent.parent / "AzureKilnChatArchive" / "settings.json"
-    for path in (current, legacy):
+    previous = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".config")
+    for path in (current, previous / "ChatArchive/settings.json", previous / "AzureKilnChatArchive/settings.json"):
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(value, dict):
@@ -71,6 +71,8 @@ def default_library() -> Path:
 
 def _source_app(value):
     return {"wechat": "wechat", "com.tencent.mm": "wechat", "微信": "wechat",
+        "wechat_pc": "wechat_pc", "qq_pc": "qq_pc", "wechat pc": "wechat_pc", "qq pc": "qq_pc",
+        "pc 微信": "wechat_pc", "pc qq": "qq_pc",
         "xhs": "xhs", "xiaohongshu": "xhs", "com.xingin.xhs": "xhs", "小红书": "xhs",
         "duoshan": "duoshan", "douyin": "duoshan", "my.maya.android": "duoshan",
         "多闪": "duoshan", "抖音": "duoshan", "多闪/抖音": "duoshan"}.get(str(value).strip().casefold(), "")
@@ -102,7 +104,7 @@ def library_summary(output: Path) -> dict:
             app = _source_app(registered)
             if not registered:
                 # A prefixed folder is explicit evidence; never infer an app from UID length.
-                app = next((source for prefix, source in (("wx", "wechat"), ("xhs", "xhs"), ("dy", "duoshan"))
+                app = next((source for prefix, source in (("wx", "wechat"), ("xhs", "xhs"), ("dy", "duoshan"), ("wxpc", "wechat_pc"), ("qqpc", "qq_pc"))
                     if (output / f"{prefix}_{uid}").is_dir()), "")
                 account_path = (output / uid).resolve()
                 if not app and account_path.is_relative_to(output.resolve()):
@@ -130,7 +132,8 @@ def library_summary(output: Path) -> dict:
                     details = {}
                 history.append({"app": app, "source": source, "time": imported,
                     "inserted": details.get("inserted", 0), "updated": details.get("updated", 0),
-                    "status": "已完成" if projection == "completed" else "待完成导出"})
+                    "status": ("部分完成，待重试" if str(source).startswith("partial:") else "已完成")
+                              if projection == "completed" else "待完成导出"})
         return {"accounts": accounts,
                 "messages": sum(r[2] for r in rows), "history": history, "database": str(database)}
     finally:
@@ -161,7 +164,7 @@ class SignalWriter(io.TextIOBase):
         self.pending = ""
 
 
-def create_window(*, sources=(), output=None, work=None):
+def create_window(*, sources=(), output=None, work=None, auto_discover=True):
     try:
         from PyQt6.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
         from PyQt6.QtGui import QDesktopServices, QFont, QColor
@@ -180,6 +183,17 @@ def create_window(*, sources=(), output=None, work=None):
             if hasattr(FluentIcon, name):
                 return getattr(FluentIcon, name)
         return FluentIcon.FOLDER
+
+    class DesktopDiscoveryWorker(QThread):
+        succeeded = pyqtSignal(object)
+        failed = pyqtSignal(str)
+
+        def run(self):
+            try:
+                from .desktop_sources import discover_desktop_sources
+                self.succeeded.emit(discover_desktop_sources())
+            except Exception as error:
+                self.failed.emit(str(error))
 
     class MediaDetailsWorker(QThread):
         progress = pyqtSignal(str)
@@ -411,8 +425,15 @@ def create_window(*, sources=(), output=None, work=None):
 
         def _redact(self, value):
             if isinstance(value, str):
-                for key in ("password", "imei", "uin"):
-                    secret = self.options.get(key)
+                secrets = [self.options.get(key) for key in ("password", "imei", "uin")]
+                def collect_keys(mapping):
+                    for secret in mapping.values():
+                        if isinstance(secret, dict):
+                            collect_keys(secret)
+                        elif isinstance(secret, str):
+                            secrets.append(secret)
+                collect_keys(self.options.get("desktop_keys") or {})
+                for secret in secrets:
                     if secret:
                         value = value.replace(str(secret), "[已隐藏]")
                 return value
@@ -456,9 +477,22 @@ def create_window(*, sources=(), output=None, work=None):
             try:
                 from . import library
                 credentials = {key: self.options.get(key) for key in ("password", "imei", "uin")}
+                if self.options.get("desktop_keys"):
+                    credentials["desktop_keys"] = self.options["desktop_keys"]
                 with redirect_stdout(writer), redirect_stderr(writer):
                     if self.operation == "discover":
-                        result = {"status": "completed", "sources": library.discover_sources(self.paths)}
+                        records = []
+                        for path in self.paths:
+                            if self.cancel_event.is_set():
+                                break
+                            try:
+                                found = library.discover_sources([path])
+                                if not found:
+                                    found = [{"source": str(path), "app": "", "status": "unrecognized", "label": "未识别到支持的聊天记录"}]
+                            except Exception as error:
+                                found = [{"source": str(path), "app": "", "status": "error", "label": str(error)}]
+                            records.extend({**record, "_root": str(path), "_origin": "manual"} for record in found)
+                        result = {"status": "cancelled" if self.cancel_event.is_set() else "completed", "sources": records}
                     elif self.operation == "inspect":
                         result = library.inspect_sources(self.paths, self.options["work"],
                             progress=self._emit_log, cancel=self.cancel_event.is_set, **credentials)
@@ -491,6 +525,11 @@ def create_window(*, sources=(), output=None, work=None):
             self.setAcceptDrops(True)
             self.saved = read_settings()
             self.sources = []
+            self.source_records = []
+            self.source_checks = {}
+            self.ignored_source_keys = set()
+            self.discovery_worker = None
+            self.pending_local_discovery = False
             self.worker = None
             self.details_worker = None
             self.details_dialog = None
@@ -520,7 +559,7 @@ def create_window(*, sources=(), output=None, work=None):
             self.reader_close_started = 0.0
             self.reader_close_forced = False
             self._busy_controls = []
-            self.import_page = self._page("import", "导入聊天备份", "微信、多闪、小红书，汇总到一个可持续更新的聊天资料库。")
+            self.import_page = self._page("import", "导入聊天记录", "选择手机备份或电脑微信、QQ 账号，汇总到一个可持续更新的聊天资料库。")
             self.library_page = self._page("library", "我的聊天资料库", "查看合并结果，打开阅读器，继续追加新的备份。")
             self.history_page = self._page("history", "任务记录", "查看本次操作的进度、结果和错误信息。")
             self.settings_page = self._page("settings", "设置", "配置显示时间和本机运行环境。")
@@ -528,7 +567,7 @@ def create_window(*, sources=(), output=None, work=None):
             self._build_library()
             self._build_history()
             self._build_settings()
-            self.addSubInterface(self.import_page, icon("DOWNLOAD", "FOLDER_ADD"), "导入备份")
+            self.addSubInterface(self.import_page, icon("DOWNLOAD", "FOLDER_ADD"), "导入聊天记录")
             self.addSubInterface(self.library_page, icon("BOOK_SHELF", "FOLDER"), "聊天资料库")
             self.addSubInterface(self.history_page, icon("HISTORY", "DOCUMENT"), "任务记录")
             self.addSubInterface(self.settings_page, icon("SETTING"), "设置", NavigationItemPosition.BOTTOM)
@@ -541,6 +580,8 @@ def create_window(*, sources=(), output=None, work=None):
             self._refresh_library()
             if sources:
                 QTimer.singleShot(0, lambda: self._start("discover"))
+            if auto_discover:
+                QTimer.singleShot(0, self._discover_local_sources)
 
         def _page(self, name, title, description):
             page = QWidget(self)
@@ -601,27 +642,33 @@ def create_window(*, sources=(), output=None, work=None):
             self._busy_controls.append(field)
 
         def _build_import(self):
-            card, layout = self._card(self.import_page, "1  添加备份", "可拖入应用备份目录、包含多个应用的目录或压缩包，也可以分次导入不同应用。")
+            card, layout = self._card(self.import_page, "1  选择聊天记录", "自动识别本机文档目录中的微信、QQ 账号。勾选需要检查或导入的来源，也可添加手机备份目录或压缩包。")
             buttons = QHBoxLayout()
             buttons.addWidget(self._button("添加文件夹", self._choose_source_folder, card, glyph=("FOLDER_ADD", "FOLDER")))
             buttons.addWidget(self._button("添加压缩包 / 数据库", self._choose_source_files, card, glyph=("ADD",)))
+            self.local_refresh_button = self._button("刷新本机账号", self._discover_local_sources, card, glyph=("SYNC",))
+            buttons.addWidget(self.local_refresh_button)
             buttons.addStretch()
             buttons.addWidget(self._button("移出列表", self._remove_selected, card, glyph=("REMOVE",)))
             layout.addLayout(buttons)
             self.source_table = TableWidget(card)
-            self.source_table.setColumnCount(3)
-            self.source_table.setHorizontalHeaderLabels(["应用", "备份位置", "状态"])
+            self.source_table.setColumnCount(5)
+            self.source_table.setHorizontalHeaderLabels(["选择", "应用", "账号", "来源位置", "状态"])
             self.source_table.verticalHeader().hide()
             self.source_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
             self.source_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
             self.source_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
             self.source_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-            self.source_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            self.source_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
             self.source_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+            self.source_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+            self.source_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+            self.source_table.itemChanged.connect(self._source_check_changed)
+            self._busy_controls.append(self.source_table)
             self.source_table.setMinimumHeight(160)
             self.source_table.setMaximumHeight(190)
             layout.addWidget(self.source_table)
-            self.source_hint = BodyLabel("尚未添加备份。原始备份会保持只读。", card)
+            self.source_hint = BodyLabel("尚未发现来源。原始记录保持只读。", card)
             self.source_hint.setStyleSheet("color: #64748b;")
             layout.addWidget(self.source_hint)
 
@@ -821,9 +868,26 @@ def create_window(*, sources=(), output=None, work=None):
                 line.addWidget(field)
                 layout.addLayout(line)
                 self._busy_controls.append(field)
+            card, layout = self._card(self.settings_page, "电脑聊天记录密钥（可选）",
+                "检查和导入时，微信 4 和 QQ NT 可从已登录客户端只读获取并验证密钥；也可提供已有密钥。旧版 QQ 使用独立加密格式，NT 密钥不通用。识别账号不读取进程，密钥不保存到设置或日志。")
+            self.desktop_key_file_edit = LineEdit(card)
+            self._path_field(layout, "密钥文件", self.desktop_key_file_edit, self._choose_desktop_key_file)
+            self.desktop_key_account_edit = LineEdit(card)
+            self.desktop_key_account_edit.setPlaceholderText("账号 ID、UID 或数据库路径；只选中一个电脑账号时可留空")
+            self.desktop_key_edit = LineEdit(card)
+            self.desktop_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+            self.desktop_key_edit.setPlaceholderText("填写已有密钥；微信 4 / QQ NT 可留空尝试只读获取")
+            for name, field in (("对应账号", self.desktop_key_account_edit), ("数据库密钥", self.desktop_key_edit)):
+                line = QHBoxLayout()
+                label = BodyLabel(name, card)
+                label.setFixedWidth(86)
+                line.addWidget(label)
+                line.addWidget(field)
+                layout.addLayout(line)
+                self._busy_controls.append(field)
             card, layout = self._card(self.settings_page, "关于")
             layout.addWidget(BodyLabel(APP_TITLE, card))
-            label = BodyLabel("用于整理已有的 Android 聊天备份。支持的来源和数据库格式会在检查结果中列出；识别失败时保留原始文件，并显示具体原因。", card)
+            label = BodyLabel("用于整理已有的手机备份和电脑聊天记录。支持的来源和数据库格式会在检查结果中列出；识别失败时保留原始文件，并显示具体原因。", card)
             label.setWordWrap(True)
             layout.addWidget(label)
             self.settings_page.body.addStretch()
@@ -884,39 +948,163 @@ def create_window(*, sources=(), output=None, work=None):
                 self._open_reader()
 
         def _add_paths(self, values, *, discover=True):
-            if self.worker is not None:
+            if self.close_requested or self.worker is not None:
                 return
+            self._remember_source_checks()
             for value in values:
                 path = Path(value).expanduser().resolve()
                 if str(path) not in self.sources:
                     self.sources.append(str(path))
-            self._fill_source_table()
+                    if not any(item.get("source") == str(path) for item in self.source_records):
+                        self.source_records.append({"source": str(path), "app": "", "status": "pending",
+                            "label": "待识别", "_root": str(path), "_origin": "manual"})
+                for item in self.source_records:
+                    if item.get("source") and Path(item["source"]).is_relative_to(path):
+                        item.update(_root=str(path), _origin="manual")
+                        self.source_checks[self._source_key(item)] = True
+                self.ignored_source_keys = {key for key in self.ignored_source_keys
+                    if not Path(key[0]).is_relative_to(path)}
+            self._fill_source_table(remember_checks=False)
             if values and discover:
                 self._start("discover")
 
-        def _fill_source_table(self, discovered=None):
-            records = discovered if discovered is not None else [
-                {"source": path, "app": "", "label": "待识别"} for path in self.sources]
-            self.source_table.setRowCount(len(records))
-            for i, item in enumerate(records):
+        def _source_key(self, item):
+            source = str(item.get("source", item.get("path", "")))
+            return (os.path.normcase(str(Path(source).expanduser().resolve())) if source else "", str(item.get("app", "")))
+
+        def _fill_source_table(self, discovered=None, *, replace_roots=(), replace_local=False, remember_checks=True):
+            if remember_checks:
+                self._remember_source_checks()
+            if discovered is not None:
+                roots = set(replace_roots)
+                existing = {self._source_key(item): item for item in self.source_records}
+                retained = [item for item in self.source_records if item.get("_root") not in roots
+                    and not (replace_local and item.get("_origin") == "local")]
+                merged = {self._source_key(item): item for item in retained}
+                for item in discovered:
+                    item = dict(item)
+                    key = self._source_key(item)
+                    if key in self.ignored_source_keys:
+                        continue
+                    old = existing.get(key, {})
+                    for field in ("_root", "_origin"):
+                        if field in old:
+                            item[field] = old[field]
+                    if key not in self.source_checks:
+                        root_key = (os.path.normcase(str(item.get("_root", ""))), "")
+                        self.source_checks[key] = self.source_checks.get(root_key, item.get("_origin") != "local")
+                    merged[key] = {**old, **item}
+                self.source_records = list(merged.values())
+            self.source_table.blockSignals(True)
+            self.source_table.setRowCount(len(self.source_records))
+            for i, item in enumerate(self.source_records):
                 source = str(item.get("source", item.get("path", "")))
                 app = str(item.get("app", ""))
-                for col, value in enumerate((APP_NAMES.get(app, app or "—"), source,
-                        str(item.get("label") or ("已识别" if app else "待识别")))):
+                key = self._source_key(item)
+                checked = self.source_checks.setdefault(key, item.get("_origin") != "local")
+                check = QTableWidgetItem()
+                check.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable)
+                check.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+                check.setData(Qt.ItemDataRole.UserRole, key)
+                self.source_table.setItem(i, 0, check)
+                account = item.get("account") or item.get("uid") or ""
+                if not account and isinstance(item.get("accounts"), list):
+                    account = "、".join(str(a.get("account") or a.get("uid") or a.get("name") or "") for a in item["accounts"] if isinstance(a, dict))
+                status = str(item.get("status", ""))
+                status = {"pending": "待识别", "error": "识别失败", "unrecognized": "未识别", "ready": "可检查", "discovered": "已识别",
+                    "encrypted": "需要密钥", "plaintext": "可检查", "unsupported": "暂不支持"}.get(status, status)
+                detail = str(item.get("label") or "")
+                status = status or ("已识别" if app else "待识别")
+                for col, value in enumerate((APP_NAMES.get(app, app or "—"), str(account or "—"), source, status), 1):
                     cell = QTableWidgetItem(value)
-                    cell.setData(Qt.ItemDataRole.UserRole, source)
-                    cell.setToolTip(value)
+                    cell.setData(Qt.ItemDataRole.UserRole, key)
+                    cell.setToolTip(detail if col == 4 and detail else value)
                     self.source_table.setItem(i, col, cell)
-            self.source_hint.setText(f"已选择 {len(self.sources)} 个位置，识别到 {len(records)} 项来源。可继续添加其他备份。" if discovered is not None
-                                    else f"已选择 {len(self.sources)} 个备份位置。可拖入文件夹或压缩包。")
+            self.source_table.blockSignals(False)
+            self._source_check_changed()
+
+        def _remember_source_checks(self):
+            for row in range(self.source_table.rowCount()):
+                cell = self.source_table.item(row, 0)
+                if cell is not None:
+                    self.source_checks[tuple(cell.data(Qt.ItemDataRole.UserRole))] = cell.checkState() == Qt.CheckState.Checked
+
+        def _source_check_changed(self, *_):
+            self._remember_source_checks()
+            count = sum(bool(self.source_checks.get(self._source_key(item))) for item in self.source_records)
+            self.source_hint.setText(f"共 {len(self.source_records)} 项来源，已勾选 {count} 项。检查和导入只处理已勾选项。")
+
+        def _selected_source_records(self):
+            self._remember_source_checks()
+            return [item for item in self.source_records if self.source_checks.get(self._source_key(item))]
+
+        def _discover_local_sources(self):
+            if self.close_requested or self.discovery_worker is not None:
+                return
+            if self.worker is not None:
+                self.pending_local_discovery = True
+                return
+            self.pending_local_discovery = False
+            self.local_refresh_button.setEnabled(False)
+            self.source_hint.setText("正在识别 Windows 文档目录中的电脑微信、QQ 账号……")
+            worker = DesktopDiscoveryWorker(self)
+            self.discovery_worker = worker
+            worker.succeeded.connect(lambda records: self._fill_source_table(
+                [{**item, "_origin": "local"} for item in records], replace_local=True))
+            worker.failed.connect(lambda message: self._fill_source_table([{"source": "", "app": "", "_origin": "local",
+                "account": "本机账号识别", "status": "error", "label": message}], replace_local=True))
+            worker.finished.connect(self._local_discovery_finished)
+            worker.start()
+
+        def _local_discovery_finished(self):
+            worker = self.discovery_worker
+            self.discovery_worker = None
+            self.local_refresh_button.setEnabled(self.worker is None and not self.close_requested)
+            if worker is not None:
+                worker.deleteLater()
+            self._continue_close()
 
         def _remove_selected(self):
-            selected = {self.source_table.item(index.row(), 1).data(Qt.ItemDataRole.UserRole)
+            if self.close_requested or self.worker is not None:
+                return
+            selected = {tuple(self.source_table.item(index.row(), 0).data(Qt.ItemDataRole.UserRole))
                         for index in self.source_table.selectionModel().selectedRows()}
-            # A parent source can expand to several detected Android users.
-            self.sources = [value for value in self.sources if not any(
-                Path(item) == Path(value) or Path(item).is_relative_to(Path(value)) for item in selected)]
+            self.ignored_source_keys.update(selected)
+            self.source_records = [item for item in self.source_records if self._source_key(item) not in selected]
+            roots = {item.get("_root") for item in self.source_records}
+            self.sources = [value for value in self.sources if value in roots]
             self._fill_source_table()
+
+        def _choose_desktop_key_file(self):
+            value, _ = QFileDialog.getOpenFileName(self, "选择电脑聊天记录密钥文件", "", "JSON (*.json);;所有文件 (*)")
+            if value:
+                self.desktop_key_file_edit.setText(value)
+
+        def _desktop_keys(self, records):
+            selected = [item for item in records if item.get("app") in ("wechat_pc", "qq_pc")]
+            if not selected:
+                return {}
+            keys = {}
+            filename = self.desktop_key_file_edit.text().strip()
+            if filename:
+                try:
+                    path = Path(filename).expanduser()
+                    if path.stat().st_size > 8 * 1024 * 1024:
+                        raise ValueError()
+                    keys = json.loads(path.read_text(encoding="utf-8-sig"))
+                    if not isinstance(keys, dict):
+                        raise ValueError()
+                except (OSError, ValueError):
+                    raise ValueError("密钥文件无法读取，或不是有效的 JSON 对象。请检查文件格式。") from None
+            value = self.desktop_key_edit.text()
+            if value:
+                selector = self.desktop_key_account_edit.text().strip()
+                if not selector and len(selected) == 1:
+                    selector = str(selected[0].get("uid") or selected[0].get("account") or selected[0]["source"])
+                if not selector:
+                    raise ValueError("填写密钥时，请指定对应账号，或只勾选一个电脑账号。")
+                keys[selector] = value
+            return keys
 
         def dragEnterEvent(self, event):
             if self.worker is None and event.mimeData().hasUrls() and any(url.isLocalFile() for url in event.mimeData().urls()):
@@ -989,20 +1177,31 @@ def create_window(*, sources=(), output=None, work=None):
         def _start(self, operation):
             if self.close_requested or self.worker is not None:
                 return
-            if operation != "download" and not self.sources:
-                self._error("请先添加至少一个备份目录或文件。")
-                return
             try:
                 options = self._options()
+                paths = []
                 if operation == "download":
                     if not options["library_download_media"]:
                         raise ValueError("请先勾选“允许下载记录中的在线媒体”，再点击补下载。")
                     if not (options["output"] / "reader.sqlite").is_file():
                         raise ValueError("资料库尚未生成。请先选择已经导入的资料库。")
+                elif operation == "discover":
+                    paths = list(self.sources)
+                    if not paths:
+                        self._discover_local_sources()
+                        return
                 else:
-                    for value in self.sources:
+                    selected = self._selected_source_records()
+                    if not selected:
+                        raise ValueError("请勾选至少一项聊天记录来源，再检查或导入。")
+                    if any(not item.get("app") or item.get("status") in ("pending", "unrecognized", "error") for item in selected):
+                        raise ValueError("勾选项中有尚未识别或识别失败的来源。请先点击“识别来源”，或取消勾选该项。")
+                    paths = list(dict.fromkeys(str(item["source"]) for item in selected))
+                    options["desktop_keys"] = self._desktop_keys(selected)
+                if operation != "download":
+                    for value in paths:
                         if not Path(value).exists():
-                            raise ValueError(f"备份位置不存在：{value}")
+                            raise ValueError(f"来源位置不存在：{value}")
                 self._save_settings(silent=True)
             except (OSError, ValueError) as error:
                 self._error(str(error))
@@ -1011,7 +1210,7 @@ def create_window(*, sources=(), output=None, work=None):
             self._log(f"开始：{labels[operation]}")
             self.last_result = None
             self._set_busy(True)
-            worker = Worker(operation, () if operation == "download" else self.sources, options, self)
+            worker = Worker(operation, paths, options, self)
             self.worker = worker
             worker.log.connect(self._log)
             worker.stage_progress.connect(self._show_stage_progress)
@@ -1027,6 +1226,7 @@ def create_window(*, sources=(), output=None, work=None):
         def _set_busy(self, busy):
             for control in self._busy_controls:
                 control.setEnabled(not busy and not self.close_requested)
+            self.local_refresh_button.setEnabled(not busy and not self.close_requested and self.discovery_worker is None)
             self.cancel_button.setEnabled(busy)
             self.history_cancel_button.setEnabled(busy)
             self.progress.setRange(0, 0 if busy else 100)
@@ -1099,7 +1299,10 @@ def create_window(*, sources=(), output=None, work=None):
             self.last_result = result
             self.result_view.setPlainText(json.dumps(result, ensure_ascii=False, indent=2, default=str))
             if isinstance(result, dict) and isinstance(result.get("sources"), list):
-                self._fill_source_table(result["sources"])
+                # A cancelled scan has not revisited every manual root. Keep
+                # unprocessed rows and their check state available for retry.
+                roots = {item.get("_root") for item in result["sources"] if item.get("_root")} if operation == "discover" else ()
+                self._fill_source_table(result["sources"], replace_roots=roots)
             status = result.get("status", "completed") if isinstance(result, dict) else "completed"
             if operation == "download":
                 counts = result.get("totals") if isinstance(result, dict) else None
@@ -1117,6 +1320,8 @@ def create_window(*, sources=(), output=None, work=None):
                 self._log("任务已停止，已完成的内容已保留。")
             elif status in ("error", "failed", "partial", "partial_failure"):
                 self._log("任务包含未完成项目，请查看任务记录。")
+                if operation == "import" and status in ("partial", "partial_failure"):
+                    self._refresh_library()
                 self.switchTo(self.history_page)
             elif operation == "import":
                 self._log("导入完成。可打开聊天阅读器查看合并结果。")
@@ -1143,6 +1348,8 @@ def create_window(*, sources=(), output=None, work=None):
             if worker is not None:
                 worker.deleteLater()
             self._continue_close()
+            if self.pending_local_discovery and not self.close_requested:
+                self._discover_local_sources()
 
         def _refresh_library(self):
             self.account_table.setRowCount(0)
@@ -1326,6 +1533,8 @@ def create_window(*, sources=(), output=None, work=None):
             self.reader_switch_timer.stop()
             self.reader_pending_options = None
             running = False
+            if self.discovery_worker is not None and self.discovery_worker.isRunning():
+                running = True
             if self.details_worker is not None and self.details_worker.isRunning():
                 self.details_worker.cancel_event.set()
                 self.details_dialog.snapshot_label.setText("已请求停止读取。请等待当前步骤完成，再关闭窗口。")
@@ -1388,12 +1597,13 @@ def create_window(*, sources=(), output=None, work=None):
                 control.setEnabled(self.worker is None)
             for control in self._details_buttons:
                 control.setEnabled(self.details_worker is None)
+            self.local_refresh_button.setEnabled(self.worker is None and self.discovery_worker is None)
             self._sync_reader_controls()
 
         def _continue_close(self):
             if not self.close_requested:
                 return
-            if self.worker is not None or self.details_worker is not None:
+            if self.worker is not None or self.details_worker is not None or self.discovery_worker is not None:
                 return
             if self.reader_process is not None and self.reader_process.poll() is None:
                 return

@@ -20,7 +20,9 @@ const sha = value => createHash('sha256').update(value).digest('hex');
 
 function fixture(t, beforeCleanup = () => {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-library-media-test-'));
-  assert.ok(!path.resolve(root).toLowerCase().startsWith('e:\\analysis\\'));
+  assert.ok(process.env.CHAT_TEST_RETAIN_ROOT
+    ? path.resolve(root).startsWith(path.resolve(process.env.CHAT_TEST_RETAIN_ROOT) + path.sep)
+    : !path.resolve(root).toLowerCase().startsWith('e:\\analysis\\'));
   t.after(async () => {
     await beforeCleanup();
     fs.rmSync(root, { recursive: true, force: true });

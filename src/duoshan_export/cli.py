@@ -48,6 +48,24 @@ def _wechat_key_flags(parser: argparse.ArgumentParser) -> None:
 def _wechat_key_options(args) -> dict:
     return {name: getattr(args, "wechat_" + name, None) for name in ("password", "imei", "uin")}
 
+def _desktop_key_flag(parser):
+    parser.add_argument("--desktop-keys", type=_path, metavar="JSON",
+                        help="Private PC database key mapping file; never copied to export/history")
+
+
+def _desktop_key_options(args):
+    filename = getattr(args, "desktop_keys", None)
+    if filename is None:
+        return {}
+    try:
+        value = filename.read_text(encoding="utf-8-sig")
+        keys = json.loads(value)
+    except (OSError, ValueError):
+        raise ExportError("Cannot read desktop key mapping JSON. Check file access and JSON syntax.") from None
+    if not isinstance(keys, dict):
+        raise ExportError("Desktop key mapping must be a JSON object keyed by account or database.")
+    return {"desktop_keys": keys}
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="duoshan-export", description="Export local Android Duoshan backups to SQLite and an offline chat reader.")
@@ -59,6 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("--sqlcipher-module-path", type=_path)
     _app_flag(inspect)
     _wechat_key_flags(inspect)
+    _desktop_key_flag(inspect)
     _json_flag(inspect)
 
     export = commands.add_parser("export", help="Create a portable export; networking is opt-in")
@@ -96,12 +115,14 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--ffprobe", default="ffprobe")
     _json_flag(doctor)
 
-    scan = commands.add_parser("scan", help="Detect/inspect WeChat, Duoshan and Xiaohongshu backup folders")
-    scan.add_argument("sources", nargs="+", type=_path)
+    scan = commands.add_parser("scan", help="Detect/inspect Android backups and Windows WeChat/QQ accounts")
+    scan.add_argument("sources", nargs="*", type=_path)
+    scan.add_argument("--local", action="store_true", help="Include WeChat/QQ accounts under Windows Documents")
     scan.add_argument("--inspect", action="store_true", help="Also decrypt databases and count accounts/messages")
     scan.add_argument("--work-dir", type=_path, default=Path.cwd() / "ChatImportWork")
     scan.add_argument("--sqlcipher-module-path", type=_path)
     _wechat_key_flags(scan)
+    _desktop_key_flag(scan)
     _json_flag(scan)
 
     merge = commands.add_parser("import", help="Incrementally import separate or newer backups into one reader library")
@@ -113,6 +134,7 @@ def build_parser() -> argparse.ArgumentParser:
     merge.add_argument("--sqlcipher-module-path", type=_path)
     merge.add_argument("--node", default="node", help="Node.js executable for reader merge")
     _wechat_key_flags(merge)
+    _desktop_key_flag(merge)
     _json_flag(merge)
 
     organize = commands.add_parser("organize", aliases=["adopt"], help="Adopt an existing reader library and prefix account folders by app")
@@ -286,10 +308,10 @@ def _inspect(args) -> dict:
             detected = discover_sources([args.source])
         except ExportError:
             detected = []
-        if args.app == "wechat" or any(item["app"] == "wechat" for item in detected):
+        if args.app == "wechat" or any(item["app"] in {"wechat", "wechat_pc", "qq_pc"} for item in detected):
             work = args.work_dir or Path(tempfile.mkdtemp(prefix="wechat-inspect-"))
             return inspect_sources([args.source], work, sqlcipher_module_path=args.sqlcipher_module_path,
-                                   **_wechat_key_options(args))
+                                   **_wechat_key_options(args), **_desktop_key_options(args))
 
     def inspect_at(work):
         layout = prepare_source(args.source, work)
@@ -392,6 +414,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Completed. Open: {args.output / 'index.html'}")
             else:
                 print(json.dumps(result, ensure_ascii=True, indent=2, default=str))
+        if isinstance(result, dict) and result.get("status") in {"partial", "partial_failure", "failed", "error"}:
+            return 1
         return 0 if args.command != "doctor" or result["core_ready"] else 1
     except KeyboardInterrupt:
         print("Interrupted. Use --resume to continue an export from the same source.", file=sys.stderr)
@@ -414,15 +438,27 @@ def _dispatch(args) -> dict:
             accounts=args.account or None, workers=args.workers, node=args.node, download_media=args.download_media)
     if args.command == "scan":
         from .library import discover_sources, inspect_sources
+        sources = list(args.sources)
+        local = []
+        if args.local:
+            from .desktop_sources import discover_desktop_sources
+            local = discover_desktop_sources()
+            sources.extend(Path(item["source"]) for item in local)
+        if not sources:
+            if args.local:
+                return {"status": "detected", "sources": [], "note": "No local Windows chat accounts found."}
+            raise ExportError("Select source paths or use scan --local.")
         if args.inspect:
-            return inspect_sources(args.sources, args.work_dir,
-                                   sqlcipher_module_path=args.sqlcipher_module_path, **_wechat_key_options(args))
-        return {"status": "detected", "sources": discover_sources(args.sources)}
+            return inspect_sources(sources, args.work_dir,
+                                   sqlcipher_module_path=args.sqlcipher_module_path,
+                                   **_wechat_key_options(args), **_desktop_key_options(args))
+        return {"status": "detected", "sources": discover_sources(sources)}
     if args.command == "import":
         from .library import import_sources
         return import_sources(args.sources, args.output, args.work_dir or args.output.with_name(args.output.name + ".work"),
             timezone=args.timezone, download_media=args.download_media,
-            sqlcipher_module_path=args.sqlcipher_module_path, node=args.node, **_wechat_key_options(args))
+            sqlcipher_module_path=args.sqlcipher_module_path, node=args.node,
+            **_wechat_key_options(args), **_desktop_key_options(args))
     if args.command in {"organize", "adopt"}:
         from .library import organize_library
         return organize_library(args.output, node=args.node)

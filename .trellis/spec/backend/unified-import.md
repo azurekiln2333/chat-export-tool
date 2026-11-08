@@ -11,10 +11,11 @@ single-app export contracts remain in effect.
 ```python
 discover_sources(paths) -> list[dict]
 inspect_sources(paths, work, *, progress=print, cancel=None,
-                sqlcipher_module_path=None, password=None, imei=None, uin=None)
+                sqlcipher_module_path=None, password=None, imei=None, uin=None,
+                desktop_keys=None)
 import_sources(paths, output, work, *, timezone="Asia/Shanghai", progress=print,
                cancel=None, download_media=False, sqlcipher_module_path=None,
-               node="node", password=None, imei=None, uin=None)
+               node="node", password=None, imei=None, uin=None, desktop_keys=None)
 organize_library(output, *, node="node", progress=print)
 import_history(output) -> list[dict]
 download_library_media(output, work, *, accounts=None, progress=print,
@@ -80,9 +81,18 @@ source, account, result and projection state. `store_meta.library_mode` is
   transactions and projection recovery; Python retains old root metadata and
   restores it only when no DB commit occurred. Never erase earlier sources
   when a later source fails.
-- Imported account directories use `wx_`, `xhs_`, `dy_`; internal IDs do not
+- Imported account directories use `wx_`, `xhs_`, `dy_`, `wxpc_`, `qqpc_`; internal IDs do not
   change. Preserve legacy identity aliases before importing raw WeChat over an
   older custom export. Folder organization alone cannot derive aliases.
+- PC source discovery, snapshot/decryption, stable account IDs and key handling
+  follow [Desktop Import](./desktop-import.md). Mixed parent discovery must not
+  stop after finding PC accounts and omit Android siblings. Concrete checked
+  account paths, not the initially selected parent, are sent to inspect/import.
+- PC source signatures include full content hashes of the bounded QQ media
+  inventory, not database timestamps alone. Partial desktop imports retain
+  readable records but use `partial:` batch IDs excluded from completed sources.
+  Stage `_library_import={source_id,status}` in the export summary before Node
+  fingerprinting so coverage changes and cache-only changes have distinct commits.
 - Credentials are passed in memory, never persisted in events/logs/settings.
   Discovery is offline; downloading is explicit opt-in.
 - Desktop launcher dependency probes must support Windows PowerShell 5.1:

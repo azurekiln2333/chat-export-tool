@@ -3,6 +3,31 @@ import test from 'node:test';
 import { api, ApiError } from '../src/api.js';
 import { loadConversations, loadMessages, state } from '../src/store.js';
 import { accountSourceLabel } from '../src/utils.js';
+import { describeMessage } from '../src/message-model.js';
+
+test('recovered QQ thumbnail labels require a contained rendered media path', () => {
+  const original = 'attachments/qq_pc/original.png', thumbnail = 'attachments/qq_pc/thumbnail.png';
+  const model = describeMessage({ text: '图片', meta: {
+    media: { kind: 'image', status: 'ok', path: thumbnail }, local_media: [thumbnail, original],
+    desktop_media: [{ path: thumbnail, variant: 'thumbnail' }, { path: original, variant: 'original' },
+      { path: 'https://example.invalid/image.png', variant: 'thumbnail' },
+      { path: 'attachments/not-rendered.png', variant: 'thumbnail' }],
+  } });
+  assert.deepEqual(model.localMediaLabels, { [thumbnail]: '缩略图（原文件尚未找到）' });
+  assert.equal(model.media.available, true);
+  assert.deepEqual(model.localAttachments, [original]);
+  assert.deepEqual(describeMessage({ text: 'Android text', meta: {} }).localMediaLabels, {});
+});
+
+test('QQ voice playback keeps a contained download link to the original recording', () => {
+  const wav = 'attachments/qq_pc/playback.wav', raw = 'attachments/qq_pc/original.silk';
+  const model = describeMessage({ meta: { media: { kind: 'voice', status: 'ok', path: wav },
+    local_media: [wav], original_media: [raw, wav, '../outside.silk', 'https://example.invalid/remote.silk'] } });
+  assert.equal(model.originalAttachments.length, 1);
+  assert.equal(model.originalAttachments[0].path, raw);
+  assert.ok(model.originalAttachments[0].href.endsWith(raw));
+  assert.deepEqual(describeMessage({ text: 'Android text', meta: {} }).originalAttachments, []);
+});
 
 test('account source labels use explicit API identities and leave unidentified accounts honest', () => {
   assert.equal(accountSourceLabel({ source_app: 'wechat', uid: '8100000000000011' }), '微信');

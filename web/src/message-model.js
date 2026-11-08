@@ -47,6 +47,14 @@ export function describeMessage(message, { accountUid = '', decorations = {} } =
   }
 
   const localList = Array.isArray(meta.local_media) ? meta.local_media : [];
+  const desktopMedia = Array.isArray(meta.desktop_media) ? meta.desktop_media : [];
+  const localMediaLabels = Object.fromEntries(desktopMedia
+    .filter(item => item && item.variant === 'thumbnail' && resolveMedia(item.path)
+      && (item.path === resource.path || localList.includes(item.path)))
+    .map(item => [item.path, '缩略图（原文件尚未找到）']));
+  const originalAttachments = (Array.isArray(meta.original_media) ? meta.original_media : [])
+    .filter(path => typeof path === 'string' && path !== resource.path && !localList.includes(path) && resolveMedia(path))
+    .map(path => ({ path, href: resolveMedia(path) }));
 
   return {
     meta,
@@ -71,6 +79,8 @@ export function describeMessage(message, { accountUid = '', decorations = {} } =
       fileName: basename(resource.path),
     },
     localAttachments: localList.filter((path) => path && path !== resource.path),
+    localMediaLabels,
+    originalAttachments,
     flags: {
       hidden: Boolean(edit.hidden),
       edited: edit.text_override !== null && edit.text_override !== undefined,
