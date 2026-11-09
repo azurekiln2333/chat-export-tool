@@ -21,6 +21,6 @@
   "children": [],
   "parent": null,
   "relatedFiles": [],
-  "notes": "Verified desktop/QQ-media code checkpoint; 322 Python and 169 Node tests pass. Actual classic QQ decryption remains blocked by unavailable matching old key/codec. Keep task open; do not claim full old-history recovery.",
+  "notes": "Classic QQ local x86 codec bridge implemented for hash-verified 9.7.23.29348, with real encrypted synthetic round-trips and mixed reader imports. Full Python regression and targeted native checks passed. Matching real classic key remains unavailable; keep actual old-history recovery open. No binary or private key is committed.",
   "meta": {}
 }

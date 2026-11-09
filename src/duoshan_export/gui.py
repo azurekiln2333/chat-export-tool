@@ -869,7 +869,7 @@ def create_window(*, sources=(), output=None, work=None, auto_discover=True):
                 layout.addLayout(line)
                 self._busy_controls.append(field)
             card, layout = self._card(self.settings_page, "电脑聊天记录密钥（可选）",
-                "检查和导入时，微信 4 和 QQ NT 可从已登录客户端只读获取并验证密钥；也可提供已有密钥。旧版 QQ 使用独立加密格式，NT 密钥不通用。识别账号不读取进程，密钥不保存到设置或日志。")
+                "微信 4 和 QQ NT 可从已登录客户端只读获取并验证密钥。旧版 QQ 需本地组件包及已有的 16 字节密钥（32 位十六进制），NT 密钥不通用。识别账号不读取进程，密钥不保存到设置或日志。")
             self.desktop_key_file_edit = LineEdit(card)
             self._path_field(layout, "密钥文件", self.desktop_key_file_edit, self._choose_desktop_key_file)
             self.desktop_key_account_edit = LineEdit(card)

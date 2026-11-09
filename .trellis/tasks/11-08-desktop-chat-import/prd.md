@@ -36,7 +36,8 @@ Add selectable account sources, Documents discovery, isolated Windows WeChat and
 
 - Code checkpoint verified on 2026-11-09: 322 Python tests, 169 Node tests,
   reader build, compileall and dependency doctor pass without skipped tests.
-- The actual classic encrypted QQ database is still unresolved: the matching
-  classic key and codec component were not available. A decrypted classic body
-  parser exists, but that does not establish recovery of the user's old history.
+- The subsequent local codec checkpoint supports explicit classic keys and
+  the verified 9.7.23.29348 component, with real encrypted synthetic fixtures.
+  The matching real classic key remains unavailable; the user's encrypted
+  Msg3.0 databases have not been decrypted or declared migrated into NT.
   Keep this requirement open and do not archive the task as fully achieved.

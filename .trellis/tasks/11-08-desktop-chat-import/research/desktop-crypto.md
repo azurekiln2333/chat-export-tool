@@ -106,7 +106,7 @@ must not be overstated.
   records. Source-copy hashes were stable during copying. The normalized
   private snapshot was supplied to the media parser for real-data inspection.
 
-## Classic QQ dependency status
+## Classic QQ dependency status at the earlier checkpoint
 
 The current installation contains QQ NT, not the old KernelUtil.dll runtime.
 The checked C/D Tencent installation locations and existing E-drive workspace
@@ -121,6 +121,10 @@ The modern SQLCipher raw key does not establish the classic key. An isolated
 helper using a supplied classic runtime/key on E-drive copies remains a
 possible follow-up; neither missing input was guessed or silently substituted.
 Classic message-field parsing is implemented independently by qq_legacy.py.
+
+This dependency finding was superseded by the user's supplied 9.7.23.29348
+installer. See `legacy-qq-component.md` for the verified local x86 codec bridge,
+actual encrypted fixture tests and remaining real account-key blocker.
 
 Real paths, account identifiers, messages, and keys are intentionally absent
 from this note. Private reports remain in the workspace validation directory.

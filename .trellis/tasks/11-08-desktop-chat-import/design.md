@@ -17,3 +17,10 @@ Stable media reference IDs preserve originals across later cache eviction and
 replace earlier thumbnails; browser audio derivatives retain downloadable originals.
 QQ's shifted lock-byte databases are normalized through an isolated SQLite reader
 process into ordinary SQLite without changing the GUI process global settings.
+
+Classic QQ now uses an optional local, hash-pinned x86 native codec helper.
+The Python bridge sends explicit scoped keys over stdin, retains private codec
+outputs and independently validates standard SQLite before returning it to the
+existing parser. Supplied classic keys never substitute for NT credentials.
+No automatic classic key recovery is claimed. Component/runtime details and
+observed tests are recorded in research/legacy-qq-component.md.

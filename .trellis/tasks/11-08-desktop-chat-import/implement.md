@@ -18,7 +18,13 @@ Actual NT inventory contains 6,473,385 records across five nonempty supported
 message tables; 368 sampled rows retained exact raw values and unique IDs.
 QQ media and crypto research notes record separate real-data validation.
 
-Remaining work requires a usable classic QQ key/codec or decrypted copy.
+The local classic QQ codec bridge is now implemented and independently reviewed.
+Real DLL-generated wrapped/unwrapped fixtures and encrypted mixed-format reader
+imports pass. Independent review added a full hash check before native decryption;
+classic-only explicit credentials intentionally do not enable NT memory scanning,
+and that behavior has a dedicated mixed-import test and documentation.
+
+Remaining real-history work requires a matching classic QQ key or decrypted copy.
 Do not infer classic-to-NT migration or mark full legacy recovery complete.
 No more computer-use actions after user Escape; no original or temporary files
-were deleted. All current code changes are ready for a checkpoint commit.
+were deleted. All component binaries stay in ignored local storage on E.

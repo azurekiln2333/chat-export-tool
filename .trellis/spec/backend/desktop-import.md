@@ -65,6 +65,17 @@ tests disable it or mock discovery so they never enumerate real accounts.
   different private cipher; NT credentials cannot decrypt it. Already decrypted
   classic tables are parsed by `qq_legacy`, including bounded TLV bodies and raw
   unknown fields. Snapshot NT and classic databases together when both exist.
+- Classic encrypted snapshots dispatch to `desktop_legacy`, isolated from NT
+  profiles and the GUI process. Local `.work/legacy-qq` or
+  `CHAT_ARCHIVE_LEGACY_QQ_DIR` contains the x86 helper and private dependencies.
+  Only the hash-verified 9.7.23.29348 codec is supported. Keys are explicit
+  account/database-scoped 16-byte values; never truncate NT credentials. No
+  classic automatic memory-key recovery is claimed. Send keys only over stdin.
+  Native integrity checks and independent SQLite validation gate publication;
+  classic validation is not HMAC authentication. Nonempty WAL/journals fail
+  explicitly. Keep codec copies and failed partials, never modify the snapshot.
+  Heartbeats and copy counters remain visible while native work runs. Cancel
+  terminates only the owned helper. Unknown native output is never logged.
 - Mixed QQ message decryption failures yield `status=partial`, with
   `failed_databases=[{database,format,error}]`; readable records can be merged.
   Single-format failure or no readable message database fails explicitly.
@@ -149,6 +160,11 @@ decrypt as zero messages, or display PC media as recovered when no asset exists.
   across refresh, checked-only Android siblings, key redaction and no persistence.
 - Node import tests: PC prefixes/source labels, edits and direction after reopen.
   Fixtures contain no real IDs, messages, keys or paths.
+- `test_qq_legacy_keys` and `test_desktop_legacy`: strict classic key scope,
+  wrong keys/components/sidecars, independent validation, input mutation and
+  no publication on failure. `test_qq_legacy_helper` uses an optional local
+  proprietary bundle to round-trip encrypted Unicode/BLOB/NULL fixtures and
+  verify real encrypted-classic + NT partial-to-complete reader imports.
 
 ## Wrong vs Correct
 

@@ -260,8 +260,10 @@ def decrypt_snapshot(source_snapshot, output, *, keys=None, account=None,
         partial.rename(output)
         return output
     is_nt = b"QQ_NT DB" in header[:128]
-    if header.startswith(b"SQLite header") and not is_nt:
-        raise ExportError("识别到旧版 QQ/TIM 私有加密数据库（Msg3.0）；它不能用 QQ NT 密钥解密。请提供受支持的解密库或导出记录。")
+    if not is_nt and (app == "qq_legacy" or header.startswith(b"SQLite header")):
+        from .desktop_legacy import decrypt_legacy_snapshot
+        return decrypt_legacy_snapshot(source, output, keys=keys, account=account,
+                                       relative_path=relative_path, progress=progress, cancel=cancel)
     profiles = (QQNT4, QQNT) if is_nt else (WECHAT4, WECHAT3)
     offset = profiles[0].offset
     with source.open("rb") as f:
